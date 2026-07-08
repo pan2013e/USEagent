@@ -3,6 +3,7 @@ from typing import Literal
 
 from loguru import logger
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import BaseToolCallPart, ModelMessage, ModelResponse
 from pydantic_ai.tools import Tool
 from pydantic_ai.usage import UsageLimits
 
@@ -92,6 +93,31 @@ def _apply_action_hook_intervention(
         restore_task_state_from_checkpoint(task_state, request.checkpoint)
     task_state.additional_knowledge.update(request.decision.additional_knowledge)
     return intervention_count, _format_action_hook_intervention_instruction(request)
+
+
+def _message_history_for_action_hook_intervention(
+    request: ActionInterventionRequest,
+    completed_messages: list[ModelMessage] | None = None,
+) -> list[ModelMessage]:
+    if completed_messages is not None and not request.decision.restore_to_checkpoint:
+        return completed_messages
+    return _drop_trailing_tool_call_messages(request.checkpoint.messages)
+
+
+def _drop_trailing_tool_call_messages(
+    messages: list[ModelMessage],
+) -> list[ModelMessage]:
+    cleaned = list(messages)
+    while cleaned:
+        message = cleaned[-1]
+        if not isinstance(message, ModelResponse):
+            break
+        if not any(
+            isinstance(part, BaseToolCallPart) for part in (message.parts or [])
+        ):
+            break
+        cleaned.pop()
+    return cleaned
 
 
 @conditional_microagents_triggers(load_microagents_from_project_dir())
@@ -218,6 +244,7 @@ def agent_loop(
             USAGE_TRACKER.add(meta_agent.name, result.usage())
             request = ACTION_HOOK_MANAGER.pop_intervention()
             if request is not None:
+                completed_messages = result.all_messages()
                 (
                     action_hook_interventions,
                     intervention_prompt,
@@ -229,7 +256,10 @@ def agent_loop(
                 if intervention_prompt is None:
                     break
                 prompt = intervention_prompt
-                message_history = request.checkpoint.messages
+                message_history = _message_history_for_action_hook_intervention(
+                    request,
+                    completed_messages,
+                )
                 continue
             break
         except ActionIntervention as intervention_exc:
@@ -244,7 +274,7 @@ def agent_loop(
             )
             if intervention_prompt is not None:
                 prompt = intervention_prompt
-                message_history = request.checkpoint.messages
+                message_history = _message_history_for_action_hook_intervention(request)
 
     last_iteration_messages = result.all_messages()
 
@@ -325,6 +355,7 @@ def agent_loop(
                         USAGE_TRACKER.add(meta_agent.name, result.usage())
                         request = ACTION_HOOK_MANAGER.pop_intervention()
                         if request is not None:
+                            completed_messages = result.all_messages()
                             (
                                 action_hook_interventions,
                                 intervention_prompt,
@@ -336,7 +367,10 @@ def agent_loop(
                             if intervention_prompt is None:
                                 break
                             new_instruction = intervention_prompt
-                            message_history = request.checkpoint.messages
+                            message_history = _message_history_for_action_hook_intervention(
+                                request,
+                                completed_messages,
+                            )
                             continue
                         break
                     except ActionIntervention as intervention_exc:
@@ -351,7 +385,9 @@ def agent_loop(
                         )
                         if intervention_prompt is not None:
                             new_instruction = intervention_prompt
-                            message_history = request.checkpoint.messages
+                            message_history = _message_history_for_action_hook_intervention(
+                                request
+                            )
                 last_iteration_messages = result.all_messages()
             except Exception as exc:
                 logger.error(

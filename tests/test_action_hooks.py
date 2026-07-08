@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic_ai import RunContext
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 
@@ -261,6 +262,67 @@ def test_restore_task_state_from_checkpoint_restores_in_memory_state(tmp_path):
     restore_task_state_from_checkpoint(ctx.deps, checkpoint)
 
     assert "speculative" not in ctx.deps.additional_knowledge
+
+
+def test_intervention_message_history_drops_unprocessed_tool_call(tmp_path):
+    ctx = make_context(tmp_path)
+    initial_user_message = ModelRequest(parts=[])
+    pending_tool_call = ModelResponse(
+        parts=[
+            TextPart(content="I will search."),
+            ToolCallPart(
+                tool_name="search_code",
+                args={"instruction": "find relevant code"},
+                tool_call_id="call-1",
+            ),
+        ]
+    )
+    request = ActionInterventionRequest(
+        checkpoint=ActionCheckpoint(
+            id="checkpoint",
+            action_name="search_code",
+            task_state=ctx.deps,
+            messages=[initial_user_message, pending_tool_call],
+            bash_history_length=0,
+            generation=0,
+        ),
+        decision=HookDecision.intervene("Try a narrower search."),
+    )
+
+    assert meta_agent_module._message_history_for_action_hook_intervention(request) == [
+        initial_user_message
+    ]
+
+
+def test_non_restore_intervention_keeps_completed_message_history(tmp_path):
+    ctx = make_context(tmp_path)
+    checkpoint_message = ModelRequest(parts=[])
+    completed_messages = [
+        checkpoint_message,
+        ModelResponse(parts=[TextPart(content="Completed action.")]),
+    ]
+    request = ActionInterventionRequest(
+        checkpoint=ActionCheckpoint(
+            id="checkpoint",
+            action_name="search_code",
+            task_state=ctx.deps,
+            messages=[checkpoint_message],
+            bash_history_length=0,
+            generation=0,
+        ),
+        decision=HookDecision.intervene(
+            "Continue from current state.",
+            restore_to_checkpoint=False,
+        ),
+    )
+
+    assert (
+        meta_agent_module._message_history_for_action_hook_intervention(
+            request,
+            completed_messages,
+        )
+        == completed_messages
+    )
 
 
 @pytest.mark.asyncio
