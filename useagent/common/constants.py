@@ -16,6 +16,8 @@ MAX_DOUBT_REITERATIONS: Final[int] = (
     2  # Counter starts from 0, so 2 retries means it runs up to two doubt sessions.
 )
 
+MAX_ACTION_HOOK_INTERVENTIONS: Final[int] = 100
+
 # =============================================================
 #                 Agent and Pydantic Constants
 # =============================================================

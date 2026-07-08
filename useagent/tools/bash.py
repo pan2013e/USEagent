@@ -607,9 +607,9 @@ def make_git_clone_warning_errorinfo() -> ToolErrorInfo:
     return ToolErrorInfo(message=message)
 
 
-def get_bash_history() -> (
-    list[tuple[NonEmptyStr, NonEmptyStr, CLIResult | ToolErrorInfo | Exception]]
-):
+def get_bash_history() -> list[
+    tuple[NonEmptyStr, NonEmptyStr, CLIResult | ToolErrorInfo | Exception]
+]:
     """
     Retrieve information of the BashTool, gathered accross agents.
 
@@ -620,3 +620,16 @@ def get_bash_history() -> (
     if _bash_tool_instance is None:
         return []
     return list(_bash_tool_instance._bash_history)
+
+
+def truncate_bash_history(length: int) -> None:
+    """
+    Truncate recorded bash history to a previous checkpoint length.
+
+    This is used by top-level action rollback. It only changes the recorded
+    trajectory, not shell process state or filesystem side effects.
+    """
+    if _bash_tool_instance is None:
+        return
+    while len(_bash_tool_instance._bash_history) > length:
+        _bash_tool_instance._bash_history.pop()

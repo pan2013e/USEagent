@@ -12,6 +12,11 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.usage import Usage, UsageLimits
 
 import useagent.common.constants as constants
+from useagent.action_hooks import (
+    ACTION_HOOK_MANAGER,
+    ActionCheckpoint,
+    TopLevelActionName,
+)
 from useagent.agents.advisor.agent import init_agent as init_advisor_agent
 from useagent.agents.checklist.agent import (
     construct_instructions as construct_checklist_instructions,
@@ -49,6 +54,30 @@ def _set_usage_tracker(tracker: UsageTracker) -> None:
     # We pass the tracker as a reference, so if the agents here write into it, its shared.
     global USAGE_TRACKER
     USAGE_TRACKER = tracker
+
+
+def _start_top_level_action(
+    action_name: TopLevelActionName,
+    ctx: RunContext[TaskState],
+) -> ActionCheckpoint | None:
+    return ACTION_HOOK_MANAGER.create_checkpoint(action_name, ctx)
+
+
+def _finish_top_level_action(
+    checkpoint: ActionCheckpoint | None,
+    ctx: RunContext[TaskState],
+    action_args: dict[str, object],
+    *,
+    result: object = None,
+    error: BaseException | None = None,
+) -> None:
+    ACTION_HOOK_MANAGER.schedule(
+        checkpoint=checkpoint,
+        action_args=action_args,
+        result=result,
+        error=error,
+        current_task_state=ctx.deps,
+    )
 
 
 # ===================================================================
@@ -176,6 +205,7 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
     As a side effect, the current environment in the TaskState will be set to the newly obtained one.
     """
     logger.info("[MetaAgent] Invoked probe_environment")
+    checkpoint = _start_top_level_action("probe_environment", ctx)
 
     logger.trace("[Probing Agent] Looking for Project root (Path)")
     path_probing_agent = init_probing_agent(output_type=Path, deps_type=None)
@@ -230,7 +260,7 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
     next_id: int = len(ctx.deps.known_environments.keys())
 
     logger.info(
-        f"[MetaAgent] Probing finished for {env.project_root} @ {env.git_status.active_git_commit} (Stored as {'env_'+str(next_id)})"
+        f"[MetaAgent] Probing finished for {env.project_root} @ {env.git_status.active_git_commit} (Stored as {'env_' + str(next_id)})"
     )
     ctx.deps.active_environment = env
     ctx.deps.known_environments["env_" + str(next_id)] = env
@@ -244,6 +274,7 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
 
     USAGE_TRACKER.add("PROBE", probing_usage)
 
+    _finish_top_level_action(checkpoint, ctx, {}, result=env)
     return env
 
 
@@ -266,6 +297,7 @@ async def execute_tests(ctx: RunContext[TaskState], instruction: str) -> TestRes
     """
     logger.info("[MetaAgent] Invoked execute_tests")
     logger.debug(f"[MetaAgent] Instructions to Execute Tests: {instruction}")
+    checkpoint = _start_top_level_action("execute_tests", ctx)
 
     test_agent = init_test_execution_agent()
     test_agent_output = await test_agent.run(
@@ -281,6 +313,12 @@ async def execute_tests(ctx: RunContext[TaskState], instruction: str) -> TestRes
 
     USAGE_TRACKER.add(test_agent.name, test_agent_output.usage())
 
+    _finish_top_level_action(
+        checkpoint,
+        ctx,
+        {"instruction": instruction},
+        result=test_result,
+    )
     return test_result
 
 
@@ -294,6 +332,7 @@ async def search_code(ctx: RunContext[TaskState], instruction: str) -> list[Loca
         list[Location]: List of locations in the codebase that match the search criteria.
     """
     logger.info(f"[MetaAgent] Invoked search_code with instruction: {instruction}")
+    checkpoint = _start_top_level_action("search_code", ctx)
     search_code_agent = init_search_code_agent()
     search_code_agent_result = await search_code_agent.run(
         instruction,
@@ -310,6 +349,12 @@ async def search_code(ctx: RunContext[TaskState], instruction: str) -> list[Loca
     ctx.deps.code_locations.extend(locations)
 
     USAGE_TRACKER.add(search_code_agent.name, search_code_agent_result.usage())
+    _finish_top_level_action(
+        checkpoint,
+        ctx,
+        {"instruction": instruction},
+        result=locations,
+    )
     return locations
 
 
@@ -333,6 +378,7 @@ async def edit_code(
         DiffEntryKey: A pointer into your TaskState's diff_store that contains a unified diff of the changes that can be applied to the codebase.
     """
     logger.info(f"[MetaAgent] Invoked edit_code with instruction: {instruction}")
+    checkpoint = _start_top_level_action("edit_code", ctx)
     try:
         edit_code_agent = init_edit_code_agent()
 
@@ -347,15 +393,28 @@ async def edit_code(
         logger.info(f"[MetaAgent] edit_code result: {diff_key}")
         # DevNote: Since #44 adding diffs to diffstore is done at `extract_diff`
         USAGE_TRACKER.add(edit_code_agent.name, edit_result.usage())
+        _finish_top_level_action(
+            checkpoint,
+            ctx,
+            {"instruction": instruction},
+            result=diff_key,
+        )
         return diff_key
 
     except UsageLimitExceeded as usage_exc:
         logger.error(
             f"[MetaAgent] `edit_code` failed due to number of requests {usage_exc}, returning a ToolErrorInfo about it"
         )
-        return ToolErrorInfo(
+        result = ToolErrorInfo(
             message="There have been issue following your instructions for `edit_code`. Either they have been too complex or too vague, or they caused an issue within the pydantic_ai framework. Reconsider your instructions and consider doing `step-by-step` changes. If the task is in a corrupted / poor state (e.g. a file was deleted that should not be), try to restore a good state of the project before editing again."
         )
+        _finish_top_level_action(
+            checkpoint,
+            ctx,
+            {"instruction": instruction},
+            result=result,
+        )
+        return result
     except (
         UnexpectedModelBehavior,
         ToolRetryError,
@@ -364,9 +423,16 @@ async def edit_code(
         logger.error(
             f"[MetaAgent] `edit_code` failed due to model behavior {ai_model_behavior_exc}, returning a ToolErrorInfo about it"
         )
-        return ToolErrorInfo(
+        result = ToolErrorInfo(
             message=f"There have been issue executing your instructions for `edit_code`. Either they have been too complex, or they caused an issue within the pydantic_ai framework. Reconsider your instructions regarding to the error {ai_model_behavior_exc} and try to avoid it. If the task is in a corrupted / poor state (e.g. a file was deleted that should not be), try to restore a good state of the project before editing again."
         )
+        _finish_top_level_action(
+            checkpoint,
+            ctx,
+            {"instruction": instruction},
+            result=result,
+        )
+        return result
     except Exception as e:
         # TODO: Do we have to look for more issues here? Do we want to?
         # There are at least ModelHTTP Errors but I think those are valid to end the run.
@@ -385,6 +451,7 @@ async def vcs(
         DiffEntryKey | str | None: A pointer to a git-diff in the diffstore of the relevant entry, a string answering a question or retrieving other information, or None in case the performed action did not need any return value.
     """
     logger.info(f"[MetaAgent] Invoked vcs_agent with instruction: {instruction}")
+    checkpoint = _start_top_level_action("vcs", ctx)
     vcs_agent = init_vcs_agent()
 
     vcs_result = await vcs_agent.run(
@@ -403,6 +470,12 @@ async def vcs(
     elif vcs_result.output is None:
         logger.info("[MetaAgent] VCS-agent returned `None`")
     USAGE_TRACKER.add(vcs_agent.name, vcs_result.usage())
+    _finish_top_level_action(
+        checkpoint,
+        ctx,
+        {"instruction": instruction},
+        result=vcs_result.output,
+    )
     return vcs_result.output
 
 

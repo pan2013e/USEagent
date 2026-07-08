@@ -8,6 +8,10 @@ from typing import Literal
 from loguru import logger
 
 from useagent import task_runner
+from useagent.action_hooks import (
+    parse_action_hook_spec_list,
+    register_action_hook_specs,
+)
 from useagent.config import AppConfig, ConfigSingleton
 from useagent.flags import USEBENCH_ENABLED
 from useagent.pydantic_models.output.action import Action
@@ -64,6 +68,16 @@ def add_common_args(parser: ArgumentParser) -> None:
         "--log-file",
         default=None,
         help="If specified, a DEBUG level log will be logger to this location.",
+    )
+    parser.add_argument(
+        "--action-hook",
+        action="append",
+        default=[],
+        help=(
+            "Top-level action hook to load at startup, as 'module:function' or "
+            "'/path/to/file.py:function'. Can be repeated. The environment "
+            "variable USEAGENT_ACTION_HOOKS also accepts comma-separated specs."
+        ),
     )
 
 
@@ -314,6 +328,11 @@ def main():
     args, subparser_dest_attr_name = parse_args()
     setup_loguru(console_log_level=args.log_level, log_file=args.log_file)
     build_and_register_config(args)
+    hook_specs = parse_action_hook_spec_list(os.environ.get("USEAGENT_ACTION_HOOKS"))
+    hook_specs.extend(args.action_hook)
+    if hook_specs:
+        registered_hooks = register_action_hook_specs(hook_specs)
+        logger.info(f"Registered {registered_hooks} top-level action hook(s)")
     handle_command(args, subparser_dest_attr_name)
 
 

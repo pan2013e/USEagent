@@ -7,6 +7,12 @@ from pydantic_ai.tools import Tool
 from pydantic_ai.usage import UsageLimits
 
 import useagent.common.constants as constants
+from useagent.action_hooks import (
+    ACTION_HOOK_MANAGER,
+    ActionIntervention,
+    ActionInterventionRequest,
+    restore_task_state_from_checkpoint,
+)
 from useagent.common.context_window import fit_messages_into_context_window
 from useagent.config import AppConfig, ConfigSingleton
 from useagent.microagents.decorators import (
@@ -55,6 +61,37 @@ def _has_real_doubts(doubts: str | None) -> bool:
         return False
     cleaned = doubts.strip().rstrip(".").lower()
     return cleaned not in _NO_DOUBT_PREFIXES
+
+
+def _apply_action_hook_intervention(
+    request: ActionInterventionRequest,
+    task_state: TaskState,
+    intervention_count: int,
+) -> tuple[int, str | None]:
+    intervention_count += 1
+    max_interventions = constants.MAX_ACTION_HOOK_INTERVENTIONS
+    if intervention_count > max_interventions:
+        reason = (
+            "maximum top-level action hook interventions exceeded "
+            f"({intervention_count}>{max_interventions})"
+        )
+        logger.warning(
+            "[ActionHook] Ignoring intervention from checkpoint "
+            f"{request.checkpoint.id} before {request.checkpoint.action_name}; "
+            f"{reason}. Future interventions will be ignored for this agent loop."
+        )
+        ACTION_HOOK_MANAGER.ignore_future_interventions(reason)
+        return intervention_count, None
+
+    logger.info(
+        "[ActionHook] Applying intervention from checkpoint "
+        f"{request.checkpoint.id} before {request.checkpoint.action_name}"
+    )
+    ACTION_HOOK_MANAGER.reset_runtime()
+    if request.decision.restore_to_checkpoint:
+        restore_task_state_from_checkpoint(task_state, request.checkpoint)
+    task_state.additional_knowledge.update(request.decision.additional_knowledge)
+    return intervention_count, _format_action_hook_intervention_instruction(request)
 
 
 @conditional_microagents_triggers(load_microagents_from_project_dir())
@@ -124,15 +161,12 @@ def init_agent(
             logger.trace(
                 f"[Setup] MetaAgent is expected to output a `{str(output_type)}`, adding output instructions."
             )
-            return (
-                f"""
+            return f"""
             ---------------------------------------------------
             Output:
 
             You are expected to return a `{str(output_type)}`.
-            """
-                + output_type.get_output_instructions()
-            )
+            """ + output_type.get_output_instructions()
         else:
             logger.warning(
                 "[Setup] MetaAgent received a output type that did not implement the `get_output_instructions` method and will have less info."
@@ -164,14 +198,54 @@ def agent_loop(
     USAGE_TRACKER = UsageTracker()
     _set_usage_tracker(USAGE_TRACKER)
     meta_agent = init_agent(output_type=output_type)
+
+    ACTION_HOOK_MANAGER.reset_runtime()
+
     # actually running the agent
     prompt = "Invoke tools to complete the task."
-    result = meta_agent.run_sync(
-        prompt,
-        deps=task_state,
-        usage_limits=UsageLimits(request_limit=constants.META_AGENT_REQUEST_LIMIT),
-    )
-    USAGE_TRACKER.add(meta_agent.name, result.usage())
+    message_history = None
+    action_hook_interventions = 0
+    while True:
+        try:
+            result = meta_agent.run_sync(
+                prompt,
+                deps=task_state,
+                usage_limits=UsageLimits(
+                    request_limit=constants.META_AGENT_REQUEST_LIMIT
+                ),
+                message_history=message_history,
+            )
+            USAGE_TRACKER.add(meta_agent.name, result.usage())
+            request = ACTION_HOOK_MANAGER.pop_intervention()
+            if request is not None:
+                (
+                    action_hook_interventions,
+                    intervention_prompt,
+                ) = _apply_action_hook_intervention(
+                    request,
+                    task_state,
+                    action_hook_interventions,
+                )
+                if intervention_prompt is None:
+                    break
+                prompt = intervention_prompt
+                message_history = request.checkpoint.messages
+                continue
+            break
+        except ActionIntervention as intervention_exc:
+            request = intervention_exc.request
+            (
+                action_hook_interventions,
+                intervention_prompt,
+            ) = _apply_action_hook_intervention(
+                request,
+                task_state,
+                action_hook_interventions,
+            )
+            if intervention_prompt is not None:
+                prompt = intervention_prompt
+                message_history = request.checkpoint.messages
+
     last_iteration_messages = result.all_messages()
 
     if (
@@ -237,15 +311,47 @@ def agent_loop(
                 )
                 new_instruction += f"\n Checklist:\n {str(checklist)}"
 
-                result = meta_agent.run_sync(
-                    new_instruction,
-                    deps=task_state,
-                    usage_limits=UsageLimits(
-                        request_limit=constants.META_AGENT_REQUEST_LIMIT
-                    ),
-                    message_history=last_iteration_messages,
-                )
-                USAGE_TRACKER.add(meta_agent.name, result.usage())
+                message_history = last_iteration_messages
+                while True:
+                    try:
+                        result = meta_agent.run_sync(
+                            new_instruction,
+                            deps=task_state,
+                            usage_limits=UsageLimits(
+                                request_limit=constants.META_AGENT_REQUEST_LIMIT
+                            ),
+                            message_history=message_history,
+                        )
+                        USAGE_TRACKER.add(meta_agent.name, result.usage())
+                        request = ACTION_HOOK_MANAGER.pop_intervention()
+                        if request is not None:
+                            (
+                                action_hook_interventions,
+                                intervention_prompt,
+                            ) = _apply_action_hook_intervention(
+                                request,
+                                task_state,
+                                action_hook_interventions,
+                            )
+                            if intervention_prompt is None:
+                                break
+                            new_instruction = intervention_prompt
+                            message_history = request.checkpoint.messages
+                            continue
+                        break
+                    except ActionIntervention as intervention_exc:
+                        request = intervention_exc.request
+                        (
+                            action_hook_interventions,
+                            intervention_prompt,
+                        ) = _apply_action_hook_intervention(
+                            request,
+                            task_state,
+                            action_hook_interventions,
+                        )
+                        if intervention_prompt is not None:
+                            new_instruction = intervention_prompt
+                            message_history = request.checkpoint.messages
                 last_iteration_messages = result.all_messages()
             except Exception as exc:
                 logger.error(
@@ -279,4 +385,28 @@ def agent_loop(
             )
             logger.error(e)
 
+    ACTION_HOOK_MANAGER.cancel_pending()
     return result.output, USAGE_TRACKER, result.all_messages()
+
+
+def _format_action_hook_intervention_instruction(
+    request: ActionInterventionRequest,
+) -> str:
+    decision = request.decision
+    reason = decision.reason or "No reason was provided."
+    return f"""
+    A non-blocking hook that runs after top-level USEagent actions has completed
+    analysis of the `{request.checkpoint.action_name}` action and requested an
+    intervention.
+
+    The agent trajectory has been restored to the checkpoint captured before
+    that action if the hook requested checkpoint restore. The rollback covers
+    in-memory TaskState, message history, and recorded bash history. It does not
+    roll back external filesystem or process side effects.
+
+    Hook reason:
+    {reason}
+
+    Continue from this checkpoint and follow the hook instruction:
+    {decision.instruction}
+    """
