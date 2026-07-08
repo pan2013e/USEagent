@@ -44,19 +44,41 @@ class GitRepository:
         # DevNote:
         # Given Local issues, there might not yet be a git repository.
         # But we need also to introduce a .git repository AND make the first commit, otherwise the later diff-extractor is very confused.
+        created_repo = False
         if not os.path.isdir(os.path.join(self.local_path, ".git")):
             run_command(["git", "init", "--quiet"], cwd=self.local_path)
-            self._configure_git()
-            run_command(["git", "add", "."], cwd=self.local_path)
-            run_command(
-                ["git", "commit", "-m", "Initial commit"],
-                stdout=DEVNULL,
-                stderr=DEVNULL,
-                cwd=self.local_path,
-            )
+            created_repo = True
+
+        if self._has_head_commit():
+            return
+
+        self._configure_git()
+        run_command(["git", "add", "."], cwd=self.local_path)
+        run_command(
+            ["git", "commit", "--allow-empty", "-m", "Initial commit"],
+            stdout=DEVNULL,
+            stderr=DEVNULL,
+            cwd=self.local_path,
+        )
+        if created_repo:
             logger.info(
                 f"[Setup] {self.local_path} was NOT a git repository - initialized a repository and made an initial commit."
             )
+        else:
+            logger.info(
+                f"[Setup] {self.local_path} had no commits - made an initial commit."
+            )
+
+    def _has_head_commit(self) -> bool:
+        return (
+            run_command(
+                ["git", "rev-parse", "--verify", "HEAD"],
+                stdout=DEVNULL,
+                stderr=DEVNULL,
+                cwd=self.local_path,
+            ).returncode
+            == 0
+        )
 
     def repo_clean_changes(self) -> None:
         """

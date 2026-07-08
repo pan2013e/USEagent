@@ -41,12 +41,29 @@ def _default_optimization_toggles() -> dict[str, bool]:
 def _default_context_window_limits() -> dict[str, int]:
     # Int value represents max-length in 'tokens', not in string length.
     # Return '-1' to mark unknown
+    openai_limits = {
+        "gpt-5.5": 1_050_000,
+        "gpt-5.5-pro": 1_050_000,
+        "gpt-5.4": 1_050_000,
+        "gpt-5.4-pro": 1_050_000,
+        "gpt-5.4-mini": 400_000,
+        "gpt-5.4-nano": 400_000,
+        "gpt-5.3-codex": 400_000,
+        "gpt-5.2": 400_000,
+        "gpt-5.2-pro": 400_000,
+        "gpt-5.2-codex": 400_000,
+        "gpt-5": 400_000,
+        "gpt-5-mini": 400_000,
+        "gpt-5-nano": 400_000,
+        "gpt-5-codex": 400_000,
+        "gpt-5-chat-latest": 128_000,
+    }
     return defaultdict(
         lambda: -1,
         {
             "google-gla:gemini-2.5-flash": 1048576,  # As seen in pydantic AI 0.7.5 on 25.08.2025
-            # "openai:gpt-5-mini": 272000,  # Looked up on 26.08.2025
-            "openai:gpt-5-mini": 100000,  # DevNote: We chose an intentionally lower token limit for cost saving purposes
+            **openai_limits,
+            **{f"openai:{model}": limit for model, limit in openai_limits.items()},
         },
     )
 

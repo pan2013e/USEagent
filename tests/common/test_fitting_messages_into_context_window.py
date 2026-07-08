@@ -102,6 +102,47 @@ async def test_fit_messages_should_return_empty_list_for_empty_input(
 
 
 @pytest.mark.asyncio
+async def test_unknown_context_window_should_raise_clear_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ConfigSingleton.config.model_descriptor = "unknown-model-for-test"
+    messages = [make_user("complete the requested task")]
+
+    async def _fail_count_tokens(messages: list[object]) -> int:
+        raise AssertionError("unknown context windows should fail before token counting")
+
+    monkeypatch.setattr(
+        "useagent.common.context_window.count_tokens", _fail_count_tokens
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await fit_messages_into_context_window(messages)
+
+    message = str(exc_info.value)
+    assert "Context window is unknown" in message
+    assert "unknown-model-for-test" in message
+    assert "_default_context_window_limits()" in message
+
+
+@pytest.mark.parametrize(
+    "model_descriptor,expected",
+    [
+        ("gpt-5.4", 1_050_000),
+        ("openai:gpt-5.4-mini", 400_000),
+        ("gpt-5", 400_000),
+        ("gpt-5-chat-latest", 128_000),
+    ],
+)
+def test_known_context_window_limits_include_current_openai_models(
+    model_descriptor: str,
+    expected: int,
+) -> None:
+    ConfigSingleton.config.model_descriptor = model_descriptor
+
+    assert ConfigSingleton.config.lookup_model_context_window() == expected
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "num_msgs,msg_len",
     [

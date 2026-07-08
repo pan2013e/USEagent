@@ -62,6 +62,16 @@ async def fit_messages_into_context_window(
         return messages
 
     context_limit: int = ConfigSingleton.config.lookup_model_context_window()
+    if context_limit <= 0:
+        raise RuntimeError(
+            "Context window is unknown for model "
+            f"{ConfigSingleton.config.model_descriptor!r}. Add its token limit to "
+            "_default_context_window_limits() in useagent/config.py or set "
+            "ConfigSingleton.config.context_window_limits for this model before "
+            "running."
+        )
+        return messages
+
     budget: int = int(context_limit * safety_buffer)
     if await count_tokens(messages) <= budget:
         # Messages are short, do nothing

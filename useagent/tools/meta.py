@@ -210,6 +210,10 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
     logger.trace("[Probing Agent] Looking for Project root (Path)")
     path_probing_agent = init_probing_agent(output_type=Path, deps_type=None)
     path_probing_agent_result = await path_probing_agent.run(
+        (
+            "Identify the absolute project root for the current working "
+            "directory. Use the bash tool if needed. Return the root path."
+        ),
         deps=None,
         usage_limits=UsageLimits(
             request_limit=constants.PROBING_AGENT_WORKDIR_REQUEST_LIMIT
@@ -220,7 +224,11 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
     logger.trace("[Probing Agent] Looking for Git Information")
     git_probing_agent = init_probing_agent(output_type=GitStatus, deps_type=None)
     git_probing_agent_result = await git_probing_agent.run(
-        #    deps=starting_status,
+        (
+            "Inspect the Git repository in the current working directory. "
+            "Return the active commit, whether it is HEAD, the current branch, "
+            "and whether there are uncommitted changes."
+        ),
         usage_limits=UsageLimits(
             request_limit=constants.PROBING_AGENT_GIT_REQUEST_LIMIT
         ),
@@ -231,6 +239,11 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
     dep_commands = Commands(build_command='echo "TODO: Identify" && :')
     command_probing_agent = init_probing_agent(output_type=Commands, deps_type=Commands)
     command_probing_agent_result = await command_probing_agent.run(
+        (
+            "Identify the important setup, build, test, run, linting, and "
+            "package-management commands for the current project. Verify likely "
+            "commands with lightweight inspection before returning them."
+        ),
         deps=dep_commands,
         usage_limits=UsageLimits(
             request_limit=constants.PROBING_AGENT_COMMAND_REQUEST_LIMIT
@@ -243,6 +256,10 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
         output_type=list[Package], deps_type=list[Package]
     )
     package_probing_agent_result = await package_probing_agent.run(
+        (
+            "Identify installed development tools and package managers that are "
+            "available in this environment and relevant to the current project."
+        ),
         deps=[],
         usage_limits=UsageLimits(
             request_limit=constants.PROBING_AGENT_PACKAGE_REQUEST_LIMIT
