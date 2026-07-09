@@ -49,6 +49,17 @@ def strip_downloading_lines(log_text: str) -> str:
     return "\n".join(filtered_lines)
 
 
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    return max(minimum, parsed)
+
+
 class _BashSession:
     """A session of a bash shell."""
 
@@ -174,7 +185,8 @@ class _BashSession:
                         supplied_arguments=[ArgumentEntry("command", command)],
                     )
 
-            if has_heredoc(command):
+            command_has_heredoc = has_heredoc(command)
+            if command_has_heredoc:
                 if not validate_heredoc(command):
                     # DevNote: See Issue 29 and the related test-suite.
                     return ToolErrorInfo(
@@ -184,7 +196,12 @@ class _BashSession:
                 logger.debug(
                     "Received a command with an EOF marker - reducing timeout to only allow short commands"
                 )
-                self._timeout = constants.BASH_TOOL_REDUCED_TIMEOUT_FOR_EOF_COMMANDS
+                heredoc_timeout = _env_float(
+                    "USEAGENT_BASH_HEREDOC_TIMEOUT_SECONDS",
+                    constants.BASH_TOOL_REDUCED_TIMEOUT_FOR_EOF_COMMANDS,
+                    minimum=1.0,
+                )
+                self._timeout = min(self._timeout, heredoc_timeout)
 
             # See Issue #40, Hotfix
             if (
@@ -194,22 +211,45 @@ class _BashSession:
                 or " grep " in command
                 or command.startswith("find")
             ):
-                self._timeout = constants.BASH_TOOL_REDUCED_TIMEOUT_FOR_RG_COMMANDS
+                self._timeout = min(
+                    self._timeout,
+                    constants.BASH_TOOL_REDUCED_TIMEOUT_FOR_RG_COMMANDS,
+                )
 
             # Build the command by encoding the intial command and add our 'finish' sentinel after.
-            effective_command = (
-                command.encode("UTF-8", "") + f"; echo '{self._sentinel}'\n".encode()
-            )
+            if command_has_heredoc:
+                effective_command_text = (
+                    command.rstrip("\n") + f"\necho '{self._sentinel}'\n"
+                )
+            else:
+                effective_command_text = (
+                    command.rstrip("\n") + f"; echo '{self._sentinel}'\n"
+                )
+            effective_command = effective_command_text.encode("UTF-8", "")
             # DevNote: Below is where the actual command is passed in, this is our `run(effective_command)`
-            self._process.stdin.write(effective_command)
-
-            await self._process.stdin.drain()
+            try:
+                self._process.stdin.write(effective_command)
+                await self._process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                if self._process.returncode is None:
+                    try:
+                        await asyncio.wait_for(self._process.wait(), timeout=0.1)
+                    except TimeoutError:
+                        pass
+                return CLIResult(
+                    system="tool must be restarted",
+                    error=(
+                        "bash has exited with returncode "
+                        f"{self._process.returncode}"
+                    ),
+                )
             stdout_buf, stderr_buf = bytearray(), bytearray()
             sentinel_bytes = self._sentinel.encode()
 
             # read output from the process, until the sentinel is found
             try:
                 async with asyncio.timeout(self._timeout):
+                    sentinel_found = False
                     # # read stdout & stderr concurrently
                     tasks = [
                         asyncio.create_task(
@@ -227,9 +267,15 @@ class _BashSession:
                     # if sentinel found, cancel others
                     for task in done:
                         if task.result() is True:
+                            sentinel_found = True
                             for t in pending:
                                 t.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
+                    if not sentinel_found and self._process.returncode is None:
+                        try:
+                            await asyncio.wait_for(self._process.wait(), timeout=0.1)
+                        except TimeoutError:
+                            pass
                     output = stdout_buf.decode(errors="replace").replace(
                         self._sentinel, ""
                     )

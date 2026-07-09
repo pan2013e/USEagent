@@ -524,11 +524,10 @@ async def test_restart_bash_session_using_config_directory_should_start_in_confi
 @pytest.mark.regression
 @pytest.mark.tool
 @pytest.mark.time_sensitive
-async def test_issue_29_python_here_doc_with_a_raw_string_markershould_execute_with_timeout(
+async def test_issue_29_python_here_doc_with_a_raw_string_marker_should_execute_without_timeout(
     tmp_path: Path, monkeypatch
 ):
     # See Issue 29, the raw string r'\n' becomes '\\n' after encoding, which then fails the EOF marker.
-    # THis one is extra strange, the .strip() makes it timeout ...
     init_bash_tool(str(tmp_path))
     tool = make_bash_tool_for_agent("AGENT-REG")
 
@@ -545,8 +544,11 @@ for p in pkgs:
 print(json.dumps(out))
 PY
 """.strip()
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(tool(cmd), timeout=5)
+    result = await asyncio.wait_for(tool(cmd), timeout=5)
+    assert result and isinstance(result, CLIResult)
+
+    parsed: dict[str, str | None] = json.loads(result.output.strip().splitlines()[-1])
+    assert "pytest" in parsed
 
 
 @pytest.mark.asyncio
