@@ -9,6 +9,7 @@ from loguru import logger
 
 from useagent import task_runner
 from useagent.action_hooks import (
+    configure_action_hook_policy_from_environment,
     parse_action_hook_spec_list,
     register_action_hook_specs,
 )
@@ -74,9 +75,27 @@ def add_common_args(parser: ArgumentParser) -> None:
         action="append",
         default=[],
         help=(
-            "Top-level action hook to load at startup, as 'module:function' or "
-            "'/path/to/file.py:function'. Can be repeated. The environment "
-            "variable USEAGENT_ACTION_HOOKS also accepts comma-separated specs."
+            "Top-level action hook to load at startup, as 'module:function', "
+            "'/path/to/file.py:function', or 'command:<shell command>'. Can be "
+            "repeated. The environment variable USEAGENT_ACTION_HOOKS also "
+            "accepts comma-separated specs."
+        ),
+    )
+    parser.add_argument(
+        "--action-hook-disable-restore",
+        action="store_true",
+        help=(
+            "Allow hook interventions but prevent them from restoring action "
+            "checkpoints. Equivalent to USEAGENT_ACTION_HOOK_ALLOW_RESTORE=0."
+        ),
+    )
+    parser.add_argument(
+        "--action-hook-restore-actions",
+        default=None,
+        help=(
+            "Comma-separated top-level actions whose hook interventions may "
+            "restore checkpoints. Defaults to USEAGENT_ACTION_HOOK_RESTORE_ACTIONS "
+            "or all actions."
         ),
     )
 
@@ -328,6 +347,10 @@ def main():
     args, subparser_dest_attr_name = parse_args()
     setup_loguru(console_log_level=args.log_level, log_file=args.log_file)
     build_and_register_config(args)
+    configure_action_hook_policy_from_environment(
+        allow_restore=False if args.action_hook_disable_restore else None,
+        restore_actions_value=args.action_hook_restore_actions,
+    )
     hook_specs = parse_action_hook_spec_list(os.environ.get("USEAGENT_ACTION_HOOKS"))
     hook_specs.extend(args.action_hook)
     if hook_specs:

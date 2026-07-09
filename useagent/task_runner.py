@@ -11,6 +11,7 @@ from typing import Literal, cast
 from loguru import logger
 from pydantic_core import to_jsonable_python
 
+from useagent.action_hooks import ACTION_HOOK_MANAGER
 from useagent.agents.meta.agent import agent_loop
 from useagent.pydantic_models.output.action import Action
 from useagent.pydantic_models.output.answer import Answer
@@ -31,7 +32,7 @@ def run(
     start_time = datetime.now()
 
     task_output_dir = (
-        Path(output_dir) / f"{task.uid}_{start_time.strftime("%Y-%m-%d_%H-%M-%S")}"
+        Path(output_dir) / f"{task.uid}_{start_time.strftime('%Y-%m-%d_%H-%M-%S')}"
     )
     task_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -44,6 +45,7 @@ def run(
             logger.warning(f"Writing non-patch swe entry to {task_output_dir}")
             task.postprocess_swebench_task(result=None, output_dir=task_output_dir)
     finally:
+        ACTION_HOOK_MANAGER.cancel_pending(clean_snapshots=True)
         end_time = datetime.now()
         duration = end_time - start_time
         logger.info(
@@ -56,6 +58,11 @@ def run(
             for a, b, c in get_bash_history():
                 json.dump({"command": a, "agent": b, "output": str(c)}, f)
                 f.write("\n")
+
+        hook_diagnostics_file: Path = task_output_dir / "action_hooks.jsonl.log"
+        logger.debug(f"Dumping Action Hook diagnostics to {hook_diagnostics_file}")
+        ACTION_HOOK_MANAGER.write_diagnostics(hook_diagnostics_file)
+        ACTION_HOOK_MANAGER.clear_diagnostics()
 
 
 def _run(

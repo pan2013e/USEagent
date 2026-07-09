@@ -1,5 +1,9 @@
+import asyncio
 import time
+from collections.abc import Awaitable
+from contextlib import suppress
 from pathlib import Path
+from typing import TypeVar
 
 from loguru import logger
 from pydantic_ai import RunContext
@@ -15,6 +19,7 @@ import useagent.common.constants as constants
 from useagent.action_hooks import (
     ACTION_HOOK_MANAGER,
     ActionCheckpoint,
+    ActionIntervention,
     TopLevelActionName,
 )
 from useagent.agents.advisor.agent import init_agent as init_advisor_agent
@@ -47,6 +52,7 @@ from useagent.state.usage_tracker import UsageTracker
 from useagent.tools.bash import get_bash_history
 
 USAGE_TRACKER: UsageTracker
+_ActionResultT = TypeVar("_ActionResultT")
 
 
 def _set_usage_tracker(tracker: UsageTracker) -> None:
@@ -78,6 +84,43 @@ def _finish_top_level_action(
         error=error,
         current_task_state=ctx.deps,
     )
+
+
+async def _await_with_action_hook_cancellation(
+    ctx: RunContext[TaskState],
+    awaitable: Awaitable[_ActionResultT],
+) -> _ActionResultT:
+    task = asyncio.create_task(awaitable)
+    try:
+        while True:
+            done, _pending = await asyncio.wait(
+                {task},
+                timeout=constants.ACTION_HOOK_CANCELLATION_POLL_SECONDS,
+            )
+            if task in done:
+                return await task
+            ACTION_HOOK_MANAGER.raise_if_intervention(current_messages=ctx.messages)
+    except Exception:
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        raise
+
+
+async def _await_top_level_action_step(
+    ctx: RunContext[TaskState],
+    checkpoint: ActionCheckpoint | None,
+    action_args: dict[str, object],
+    awaitable: Awaitable[_ActionResultT],
+) -> _ActionResultT:
+    try:
+        return await _await_with_action_hook_cancellation(ctx, awaitable)
+    except ActionIntervention:
+        raise
+    except Exception as exc:
+        _finish_top_level_action(checkpoint, ctx, action_args, error=exc)
+        raise
 
 
 # ===================================================================
@@ -209,28 +252,38 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
 
     logger.trace("[Probing Agent] Looking for Project root (Path)")
     path_probing_agent = init_probing_agent(output_type=Path, deps_type=None)
-    path_probing_agent_result = await path_probing_agent.run(
-        (
-            "Identify the absolute project root for the current working "
-            "directory. Use the bash tool if needed. Return the root path."
-        ),
-        deps=None,
-        usage_limits=UsageLimits(
-            request_limit=constants.PROBING_AGENT_WORKDIR_REQUEST_LIMIT
+    path_probing_agent_result = await _await_top_level_action_step(
+        ctx,
+        checkpoint,
+        {},
+        path_probing_agent.run(
+            (
+                "Identify the absolute project root for the current working "
+                "directory. Use the bash tool if needed. Return the root path."
+            ),
+            deps=None,
+            usage_limits=UsageLimits(
+                request_limit=constants.PROBING_AGENT_WORKDIR_REQUEST_LIMIT
+            ),
         ),
     )
     project_root = path_probing_agent_result.output
 
     logger.trace("[Probing Agent] Looking for Git Information")
     git_probing_agent = init_probing_agent(output_type=GitStatus, deps_type=None)
-    git_probing_agent_result = await git_probing_agent.run(
-        (
-            "Inspect the Git repository in the current working directory. "
-            "Return the active commit, whether it is HEAD, the current branch, "
-            "and whether there are uncommitted changes."
-        ),
-        usage_limits=UsageLimits(
-            request_limit=constants.PROBING_AGENT_GIT_REQUEST_LIMIT
+    git_probing_agent_result = await _await_top_level_action_step(
+        ctx,
+        checkpoint,
+        {},
+        git_probing_agent.run(
+            (
+                "Inspect the Git repository in the current working directory. "
+                "Return the active commit, whether it is HEAD, the current branch, "
+                "and whether there are uncommitted changes."
+            ),
+            usage_limits=UsageLimits(
+                request_limit=constants.PROBING_AGENT_GIT_REQUEST_LIMIT
+            ),
         ),
     )
     git_status = git_probing_agent_result.output
@@ -238,15 +291,20 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
     logger.trace("[Probing Agent] Looking for Important Commands")
     dep_commands = Commands(build_command='echo "TODO: Identify" && :')
     command_probing_agent = init_probing_agent(output_type=Commands, deps_type=Commands)
-    command_probing_agent_result = await command_probing_agent.run(
-        (
-            "Identify the important setup, build, test, run, linting, and "
-            "package-management commands for the current project. Verify likely "
-            "commands with lightweight inspection before returning them."
-        ),
-        deps=dep_commands,
-        usage_limits=UsageLimits(
-            request_limit=constants.PROBING_AGENT_COMMAND_REQUEST_LIMIT
+    command_probing_agent_result = await _await_top_level_action_step(
+        ctx,
+        checkpoint,
+        {},
+        command_probing_agent.run(
+            (
+                "Identify the important setup, build, test, run, linting, and "
+                "package-management commands for the current project. Verify likely "
+                "commands with lightweight inspection before returning them."
+            ),
+            deps=dep_commands,
+            usage_limits=UsageLimits(
+                request_limit=constants.PROBING_AGENT_COMMAND_REQUEST_LIMIT
+            ),
         ),
     )
     commands = command_probing_agent_result.output
@@ -255,14 +313,19 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
     package_probing_agent = init_probing_agent(
         output_type=list[Package], deps_type=list[Package]
     )
-    package_probing_agent_result = await package_probing_agent.run(
-        (
-            "Identify installed development tools and package managers that are "
-            "available in this environment and relevant to the current project."
-        ),
-        deps=[],
-        usage_limits=UsageLimits(
-            request_limit=constants.PROBING_AGENT_PACKAGE_REQUEST_LIMIT
+    package_probing_agent_result = await _await_top_level_action_step(
+        ctx,
+        checkpoint,
+        {},
+        package_probing_agent.run(
+            (
+                "Identify installed development tools and package managers that are "
+                "available in this environment and relevant to the current project."
+            ),
+            deps=[],
+            usage_limits=UsageLimits(
+                request_limit=constants.PROBING_AGENT_PACKAGE_REQUEST_LIMIT
+            ),
         ),
     )
     packages = package_probing_agent_result.output
@@ -317,13 +380,27 @@ async def execute_tests(ctx: RunContext[TaskState], instruction: str) -> TestRes
     checkpoint = _start_top_level_action("execute_tests", ctx)
 
     test_agent = init_test_execution_agent()
-    test_agent_output = await test_agent.run(
-        instruction,
-        deps=ctx.deps,
-        usage_limits=UsageLimits(
-            request_limit=constants.EXECUTE_TESTS_AGENT_REQUEST_LIMIT
-        ),
-    )
+    try:
+        test_agent_output = await _await_with_action_hook_cancellation(
+            ctx,
+            test_agent.run(
+                instruction,
+                deps=ctx.deps,
+                usage_limits=UsageLimits(
+                    request_limit=constants.EXECUTE_TESTS_AGENT_REQUEST_LIMIT
+                ),
+            ),
+        )
+    except ActionIntervention:
+        raise
+    except Exception as exc:
+        _finish_top_level_action(
+            checkpoint,
+            ctx,
+            {"instruction": instruction},
+            error=exc,
+        )
+        raise
     test_result: TestResult = test_agent_output.output
 
     logger.info(f"[Test Execution Agent] Tests resulted in {test_result}")
@@ -351,11 +428,27 @@ async def search_code(ctx: RunContext[TaskState], instruction: str) -> list[Loca
     logger.info(f"[MetaAgent] Invoked search_code with instruction: {instruction}")
     checkpoint = _start_top_level_action("search_code", ctx)
     search_code_agent = init_search_code_agent()
-    search_code_agent_result = await search_code_agent.run(
-        instruction,
-        deps=ctx.deps,
-        usage_limits=UsageLimits(request_limit=constants.SEARCH_AGENT_REQUEST_LIMIT),
-    )
+    try:
+        search_code_agent_result = await _await_with_action_hook_cancellation(
+            ctx,
+            search_code_agent.run(
+                instruction,
+                deps=ctx.deps,
+                usage_limits=UsageLimits(
+                    request_limit=constants.SEARCH_AGENT_REQUEST_LIMIT
+                ),
+            ),
+        )
+    except ActionIntervention:
+        raise
+    except Exception as exc:
+        _finish_top_level_action(
+            checkpoint,
+            ctx,
+            {"instruction": instruction},
+            error=exc,
+        )
+        raise
     locations = search_code_agent_result.output
     logger.info(
         f"[MetaAgent] search_code result found: {len(locations)} locations (see TRACE for detail)"
@@ -399,11 +492,14 @@ async def edit_code(
     try:
         edit_code_agent = init_edit_code_agent()
 
-        edit_result = await edit_code_agent.run(
-            instruction,
-            deps=ctx.deps,
-            usage_limits=UsageLimits(
-                request_limit=constants.EDIT_CODE_AGENT_REQUEST_LIMIT
+        edit_result = await _await_with_action_hook_cancellation(
+            ctx,
+            edit_code_agent.run(
+                instruction,
+                deps=ctx.deps,
+                usage_limits=UsageLimits(
+                    request_limit=constants.EDIT_CODE_AGENT_REQUEST_LIMIT
+                ),
             ),
         )
         diff_key: DiffEntryKey = edit_result.output
@@ -450,9 +546,17 @@ async def edit_code(
             result=result,
         )
         return result
+    except ActionIntervention:
+        raise
     except Exception as e:
         # TODO: Do we have to look for more issues here? Do we want to?
         # There are at least ModelHTTP Errors but I think those are valid to end the run.
+        _finish_top_level_action(
+            checkpoint,
+            ctx,
+            {"instruction": instruction},
+            error=e,
+        )
         raise e
 
 
@@ -471,11 +575,27 @@ async def vcs(
     checkpoint = _start_top_level_action("vcs", ctx)
     vcs_agent = init_vcs_agent()
 
-    vcs_result = await vcs_agent.run(
-        instruction,
-        deps=ctx.deps,
-        usage_limits=UsageLimits(request_limit=constants.VCS_AGENT_REQUEST_LIMIT),
-    )
+    try:
+        vcs_result = await _await_with_action_hook_cancellation(
+            ctx,
+            vcs_agent.run(
+                instruction,
+                deps=ctx.deps,
+                usage_limits=UsageLimits(
+                    request_limit=constants.VCS_AGENT_REQUEST_LIMIT
+                ),
+            ),
+        )
+    except ActionIntervention:
+        raise
+    except Exception as exc:
+        _finish_top_level_action(
+            checkpoint,
+            ctx,
+            {"instruction": instruction},
+            error=exc,
+        )
+        raise
 
     if isinstance(vcs_result.output, str) and vcs_result.output.startswith("diff_"):
         diff_key: DiffEntryKey = vcs_result.output

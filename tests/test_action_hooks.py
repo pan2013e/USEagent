@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -22,12 +23,16 @@ from useagent.action_hooks import (
     ActionCheckpoint,
     ActionHookEvent,
     ActionHookManager,
+    ActionHookPolicy,
     ActionIntervention,
     ActionInterventionRequest,
     HookCancellationToken,
     HookDecision,
+    cleanup_filesystem_snapshot,
+    create_filesystem_snapshot,
     load_action_hook_spec,
     parse_action_hook_spec_list,
+    restore_filesystem_snapshot,
     restore_task_state_from_checkpoint,
     restore_task_state_from_snapshot,
 )
@@ -283,6 +288,26 @@ def test_restore_task_state_from_snapshot_preserves_post_action_state(tmp_path):
     assert ctx.deps.additional_knowledge == {"post_action": "preserved"}
 
 
+def test_restore_filesystem_snapshot_restores_project_files(tmp_path):
+    ctx = make_context(tmp_path)
+    keep_file = tmp_path / "keep.txt"
+    keep_file.write_text("after action")
+    snapshot = create_filesystem_snapshot(ctx.deps)
+    assert snapshot is not None
+
+    try:
+        keep_file.write_text("later action")
+        (tmp_path / "later.txt").write_text("remove me")
+
+        restore_filesystem_snapshot(snapshot)
+
+        assert keep_file.read_text() == "after action"
+        assert not (tmp_path / "later.txt").exists()
+        assert (tmp_path / ".git").exists()
+    finally:
+        cleanup_filesystem_snapshot(snapshot)
+
+
 def test_restore_intervention_message_history_preserves_completed_action(tmp_path):
     ctx = make_context(tmp_path)
     initial_user_message = ModelRequest(parts=[])
@@ -431,6 +456,149 @@ def test_pending_intervention_captures_interrupted_history(tmp_path):
         manager.raise_if_intervention(current_messages=[current_message])
 
     assert exc_info.value.request.replay_messages == [current_message]
+
+
+@pytest.mark.asyncio
+async def test_restore_policy_downgrades_restore_intervention(tmp_path):
+    ctx = make_context(tmp_path)
+    manager = ActionHookManager()
+    manager.configure_policy(ActionHookPolicy(allow_restore=False))
+    manager.register(
+        lambda event, token: HookDecision.intervene("Continue without restore.")
+    )
+    checkpoint = manager.create_checkpoint("search_code", ctx)
+    assert checkpoint is not None
+
+    manager.schedule(
+        checkpoint=checkpoint,
+        action_args={"instruction": "find code"},
+        result=[],
+        current_task_state=ctx.deps,
+    )
+    await asyncio.sleep(0)
+
+    request = manager.pop_intervention()
+    assert request is not None
+    assert request.decision.restore_to_checkpoint is False
+    assert any(
+        item["event"] == "restore_downgraded" for item in manager.diagnostics()
+    )
+    manager.cleanup_filesystem_snapshots()
+
+
+@pytest.mark.asyncio
+async def test_command_action_hook_spec_returns_intervention(tmp_path):
+    hook_file = tmp_path / "command_hook.py"
+    hook_file.write_text(
+        "\n".join(
+            [
+                "import json",
+                "import sys",
+                "payload = json.load(sys.stdin)",
+                "print(json.dumps({",
+                "    'kind': 'intervene',",
+                "    'instruction': 'Command hook says continue carefully.',",
+                "    'reason': payload['event']['action_name'],",
+                "    'additional_knowledge': {'command_hook': 'ran'},",
+                "    'restore_to_checkpoint': False,",
+                "}))",
+            ]
+        )
+    )
+    hook = load_action_hook_spec(f"command:{sys.executable} {hook_file}")
+    ctx = make_context(tmp_path)
+    checkpoint = ActionCheckpoint(
+        id="checkpoint",
+        action_name="search_code",
+        task_state=ctx.deps,
+        messages=[],
+        bash_history_length=0,
+        generation=0,
+    )
+
+    decision_or_awaitable = hook(
+        ActionHookEvent(
+            action_name="search_code",
+            action_args={"instruction": "find code"},
+            result=[],
+            error=None,
+            checkpoint=checkpoint,
+            current_task_state=ctx.deps,
+            current_bash_history_length=0,
+        ),
+        HookCancellationToken(),
+    )
+    assert inspect.isawaitable(decision_or_awaitable)
+    decision = await decision_or_awaitable
+
+    assert decision == HookDecision.intervene(
+        "Command hook says continue carefully.",
+        reason="search_code",
+        additional_knowledge={"command_hook": "ran"},
+        restore_to_checkpoint=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mid_action_intervention_cancels_running_action(monkeypatch, tmp_path):
+    monkeypatch.setattr(constants, "ACTION_HOOK_CANCELLATION_POLL_SECONDS", 0.01)
+    ctx = make_context(tmp_path)
+    cancelled = asyncio.Event()
+    manager = ACTION_HOOK_MANAGER
+    manager._intervention = ActionInterventionRequest(
+        checkpoint=ActionCheckpoint(
+            id="checkpoint",
+            action_name="probe_environment",
+            task_state=ctx.deps,
+            messages=[],
+            bash_history_length=0,
+            generation=0,
+        ),
+        decision=HookDecision.intervene("Stop the current action."),
+    )
+
+    async def slow_action():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    with pytest.raises(ActionIntervention):
+        await meta._await_with_action_hook_cancellation(ctx, slow_action())
+
+    await asyncio.wait_for(cancelled.wait(), 1)
+
+
+@pytest.mark.asyncio
+async def test_uncaught_top_level_action_exception_schedules_hook(
+    monkeypatch,
+    tmp_path,
+):
+    ctx = make_context(tmp_path)
+    meta.USAGE_TRACKER = UsageTracker()
+    seen_error: list[BaseException | None] = []
+    seen = asyncio.Event()
+
+    class FailingSearchAgent:
+        name = "SEARCH"
+
+        async def run(self, *args, **kwargs):
+            raise RuntimeError("search failed")
+
+    async def hook(event, token):
+        seen_error.append(event.error)
+        seen.set()
+        return HookDecision.noop("observed error")
+
+    monkeypatch.setattr(meta, "init_search_code_agent", lambda: FailingSearchAgent())
+    ACTION_HOOK_MANAGER.register(hook)
+
+    with pytest.raises(RuntimeError, match="search failed"):
+        await meta.search_code(ctx, "find relevant code")
+
+    await asyncio.wait_for(seen.wait(), 1)
+    assert isinstance(seen_error[0], RuntimeError)
 
 
 @pytest.mark.asyncio

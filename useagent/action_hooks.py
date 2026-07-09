@@ -6,6 +6,12 @@ import hashlib
 import importlib
 import importlib.util
 import inspect
+import json
+import os
+import shlex
+import shutil
+import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +21,9 @@ from uuid import uuid4
 from loguru import logger
 from pydantic_ai import RunContext
 from pydantic_ai.messages import ModelMessage
+from pydantic_core import to_jsonable_python
 
+import useagent.common.constants as constants
 from useagent.pydantic_models.task_state import TaskState
 from useagent.tools.bash import get_bash_history, truncate_bash_history
 
@@ -40,6 +48,13 @@ class ActionCheckpoint:
 
 
 @dataclass(frozen=True)
+class FilesystemSnapshot:
+    root: Path
+    snapshot_root: Path
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass(frozen=True)
 class HookCancellationToken:
     _cancelled: bool = False
 
@@ -60,6 +75,7 @@ class ActionHookEvent:
     checkpoint: ActionCheckpoint
     current_task_state: TaskState
     current_bash_history_length: int
+    current_filesystem_snapshot: FilesystemSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +121,20 @@ class ActionInterventionRequest:
     replay_messages: list[ModelMessage] | None = None
     restore_task_state: TaskState | None = None
     restore_bash_history_length: int | None = None
+    restore_filesystem_snapshot: FilesystemSnapshot | None = None
+
+
+@dataclass(frozen=True)
+class ActionHookPolicy:
+    allow_restore: bool = True
+    restore_actions: frozenset[TopLevelActionName] | None = None
+
+    def allows_restore(self, action_name: TopLevelActionName) -> bool:
+        if not self.allow_restore:
+            return False
+        if self.restore_actions is not None and action_name not in self.restore_actions:
+            return False
+        return True
 
 
 class ActionIntervention(Exception):
@@ -122,8 +152,13 @@ class ActionHookManager:
     def __init__(self) -> None:
         self._hooks: list[ActionHook] = []
         self._pending: dict[asyncio.Task[None], HookCancellationToken] = {}
+        self._pending_checkpoints: dict[asyncio.Task[None], str] = {}
+        self._checkpoint_pending_counts: dict[str, int] = {}
+        self._filesystem_snapshots: dict[str, FilesystemSnapshot] = {}
         self._intervention: ActionInterventionRequest | None = None
         self._interventions_ignored_reason: str | None = None
+        self._policy = ActionHookPolicy()
+        self._diagnostics: list[dict[str, Any]] = []
         self._generation = 0
 
     @property
@@ -132,6 +167,7 @@ class ActionHookManager:
 
     def register(self, hook: ActionHook) -> Callable[[], None]:
         self._hooks.append(hook)
+        self.record_diagnostic("hook_registered", hook=_hook_name(hook))
 
         def unregister() -> None:
             self.unregister(hook)
@@ -142,23 +178,55 @@ class ActionHookManager:
         self._hooks = [registered for registered in self._hooks if registered != hook]
 
     def clear_hooks(self) -> None:
-        self.cancel_pending()
+        self.cancel_pending(clean_snapshots=True)
         self._hooks.clear()
         self._intervention = None
         self._interventions_ignored_reason = None
         self._generation += 1
 
-    def reset_runtime(self) -> None:
-        self.cancel_pending()
+    def reset_runtime(self, preserve_snapshot_id: str | None = None) -> None:
+        self.cancel_pending(
+            clean_snapshots=True,
+            preserve_snapshot_id=preserve_snapshot_id,
+        )
         self._intervention = None
         self._interventions_ignored_reason = None
         self._generation += 1
 
     def ignore_future_interventions(self, reason: str) -> None:
-        self.cancel_pending()
+        self.cancel_pending(clean_snapshots=True)
         self._intervention = None
         self._interventions_ignored_reason = reason
         self._generation += 1
+        self.record_diagnostic("interventions_ignored", reason=reason)
+
+    def configure_policy(self, policy: ActionHookPolicy) -> None:
+        self._policy = policy
+        self.record_diagnostic(
+            "policy_configured",
+            allow_restore=policy.allow_restore,
+            restore_actions=sorted(policy.restore_actions or []),
+        )
+
+    def record_diagnostic(self, event: str, **fields: Any) -> None:
+        self._diagnostics.append(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "event": event,
+                **_safe_jsonable(fields),
+            }
+        )
+
+    def diagnostics(self) -> list[dict[str, Any]]:
+        return list(self._diagnostics)
+
+    def clear_diagnostics(self) -> None:
+        self._diagnostics.clear()
+
+    def write_diagnostics(self, path: Path) -> None:
+        with open(path, "w", encoding="utf-8") as file:
+            for item in self._diagnostics:
+                file.write(json.dumps(item, sort_keys=True) + "\n")
 
     def create_checkpoint(
         self,
@@ -189,6 +257,17 @@ class ActionHookManager:
         if checkpoint is None or not self.has_hooks:
             return
 
+        filesystem_snapshot = create_filesystem_snapshot(current_task_state)
+        if filesystem_snapshot is not None:
+            self._filesystem_snapshots[checkpoint.id] = filesystem_snapshot
+        self._checkpoint_pending_counts[checkpoint.id] = len(self._hooks)
+        self.record_diagnostic(
+            "action_scheduled",
+            action_name=checkpoint.action_name,
+            checkpoint_id=checkpoint.id,
+            has_filesystem_snapshot=filesystem_snapshot is not None,
+            error_type=type(error).__name__ if error is not None else None,
+        )
         event = ActionHookEvent(
             action_name=checkpoint.action_name,
             action_args=action_args,
@@ -197,6 +276,7 @@ class ActionHookManager:
             checkpoint=checkpoint,
             current_task_state=copy.deepcopy(current_task_state),
             current_bash_history_length=len(get_bash_history()),
+            current_filesystem_snapshot=filesystem_snapshot,
         )
         for hook in list(self._hooks):
             token = HookCancellationToken()
@@ -205,7 +285,8 @@ class ActionHookManager:
                 name=f"action-hook:{checkpoint.action_name}:{checkpoint.id}",
             )
             self._pending[task] = token
-            task.add_done_callback(lambda done: self._pending.pop(done, None))
+            self._pending_checkpoints[task] = checkpoint.id
+            task.add_done_callback(self._hook_task_done)
 
     def pop_intervention(self) -> ActionInterventionRequest | None:
         request = self._intervention
@@ -224,16 +305,58 @@ class ActionHookManager:
                     replay_messages=copy.deepcopy(current_messages),
                     restore_task_state=request.restore_task_state,
                     restore_bash_history_length=request.restore_bash_history_length,
+                    restore_filesystem_snapshot=request.restore_filesystem_snapshot,
                 )
             raise ActionIntervention(request)
 
-    def cancel_pending(self) -> None:
+    def cancel_pending(
+        self,
+        *,
+        clean_snapshots: bool = False,
+        preserve_snapshot_id: str | None = None,
+    ) -> None:
         pending = list(self._pending.items())
         self._pending.clear()
+        self._pending_checkpoints.clear()
+        self._checkpoint_pending_counts.clear()
         for task, token in pending:
             token.cancel()
             if not task.done():
                 task.cancel()
+        if clean_snapshots:
+            self.cleanup_filesystem_snapshots(preserve_snapshot_id=preserve_snapshot_id)
+
+    def cleanup_filesystem_snapshots(
+        self,
+        *,
+        preserve_snapshot_id: str | None = None,
+    ) -> None:
+        for checkpoint_id in list(self._filesystem_snapshots):
+            if checkpoint_id == preserve_snapshot_id:
+                continue
+            snapshot = self._filesystem_snapshots.pop(checkpoint_id)
+            cleanup_filesystem_snapshot(snapshot)
+
+    def cleanup_filesystem_snapshot(self, checkpoint_id: str) -> None:
+        snapshot = self._filesystem_snapshots.pop(checkpoint_id, None)
+        if snapshot is not None:
+            cleanup_filesystem_snapshot(snapshot)
+
+    def _hook_task_done(self, task: asyncio.Task[None]) -> None:
+        self._pending.pop(task, None)
+        checkpoint_id = self._pending_checkpoints.pop(task, None)
+        if checkpoint_id is None:
+            return
+        remaining = self._checkpoint_pending_counts.get(checkpoint_id, 0) - 1
+        if remaining <= 0:
+            self._checkpoint_pending_counts.pop(checkpoint_id, None)
+            if (
+                self._intervention is None
+                or self._intervention.checkpoint.id != checkpoint_id
+            ):
+                self.cleanup_filesystem_snapshot(checkpoint_id)
+        else:
+            self._checkpoint_pending_counts[checkpoint_id] = remaining
 
     async def _run_hook(
         self,
@@ -241,6 +364,8 @@ class ActionHookManager:
         event: ActionHookEvent,
         token: HookCancellationToken,
     ) -> None:
+        hook_name = _hook_name(hook)
+        start = time.monotonic()
         try:
             decision_or_awaitable = hook(event, token)
             if inspect.isawaitable(decision_or_awaitable):
@@ -248,17 +373,47 @@ class ActionHookManager:
             else:
                 decision = decision_or_awaitable
         except asyncio.CancelledError:
+            self.record_diagnostic(
+                "hook_cancelled",
+                hook=hook_name,
+                action_name=event.action_name,
+                checkpoint_id=event.checkpoint.id,
+            )
             raise
         except Exception as exc:
             logger.exception(
                 f"[ActionHook] Hook failed after {event.action_name}: {exc}"
             )
+            self.record_diagnostic(
+                "hook_failed",
+                hook=hook_name,
+                action_name=event.action_name,
+                checkpoint_id=event.checkpoint.id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             return
 
         if token.cancelled or decision is None or decision.kind == "noop":
+            self.record_diagnostic(
+                "hook_completed",
+                hook=hook_name,
+                action_name=event.action_name,
+                checkpoint_id=event.checkpoint.id,
+                decision_kind="noop" if decision is None else decision.kind,
+                reason=None if decision is None else decision.reason,
+                duration_seconds=round(time.monotonic() - start, 6),
+            )
             return
         if decision.kind != "intervene":
             logger.warning(f"[ActionHook] Ignoring unknown decision: {decision}")
+            self.record_diagnostic(
+                "hook_ignored",
+                hook=hook_name,
+                action_name=event.action_name,
+                checkpoint_id=event.checkpoint.id,
+                reason="unknown decision kind",
+            )
             return
         if event.checkpoint.generation != self._generation:
             logger.info(
@@ -266,9 +421,23 @@ class ActionHookManager:
                 f"{event.checkpoint.generation}; current generation is "
                 f"{self._generation}"
             )
+            self.record_diagnostic(
+                "intervention_ignored",
+                hook=hook_name,
+                action_name=event.action_name,
+                checkpoint_id=event.checkpoint.id,
+                reason="stale generation",
+            )
             return
         if not decision.instruction:
             logger.warning("[ActionHook] Ignoring intervention without instruction")
+            self.record_diagnostic(
+                "intervention_ignored",
+                hook=hook_name,
+                action_name=event.action_name,
+                checkpoint_id=event.checkpoint.id,
+                reason="missing instruction",
+            )
             return
 
         if self._interventions_ignored_reason is not None:
@@ -276,7 +445,31 @@ class ActionHookManager:
                 "[ActionHook] Ignoring intervention after "
                 f"{event.action_name}: {self._interventions_ignored_reason}"
             )
+            self.record_diagnostic(
+                "intervention_ignored",
+                hook=hook_name,
+                action_name=event.action_name,
+                checkpoint_id=event.checkpoint.id,
+                reason=self._interventions_ignored_reason,
+            )
             return
+
+        if decision.restore_to_checkpoint and not self._policy.allows_restore(
+            event.action_name
+        ):
+            decision = HookDecision.intervene(
+                decision.instruction,
+                reason=decision.reason,
+                additional_knowledge=decision.additional_knowledge,
+                restore_to_checkpoint=False,
+            )
+            self.record_diagnostic(
+                "restore_downgraded",
+                hook=hook_name,
+                action_name=event.action_name,
+                checkpoint_id=event.checkpoint.id,
+                reason="restore disallowed by action hook policy",
+            )
 
         if self._intervention is None:
             self._intervention = ActionInterventionRequest(
@@ -284,10 +477,29 @@ class ActionHookManager:
                 decision=decision,
                 restore_task_state=event.current_task_state,
                 restore_bash_history_length=event.current_bash_history_length,
+                restore_filesystem_snapshot=event.current_filesystem_snapshot,
             )
             logger.info(
                 "[ActionHook] Queued intervention after "
                 f"{event.action_name}: {decision.reason or decision.instruction}"
+            )
+            self.record_diagnostic(
+                "intervention_queued",
+                hook=hook_name,
+                action_name=event.action_name,
+                checkpoint_id=event.checkpoint.id,
+                reason=decision.reason,
+                restore_to_checkpoint=decision.restore_to_checkpoint,
+                has_filesystem_snapshot=event.current_filesystem_snapshot is not None,
+                duration_seconds=round(time.monotonic() - start, 6),
+            )
+        else:
+            self.record_diagnostic(
+                "intervention_ignored",
+                hook=hook_name,
+                action_name=event.action_name,
+                checkpoint_id=event.checkpoint.id,
+                reason="another intervention is already queued",
             )
 
 
@@ -331,15 +543,115 @@ def _restore_task_state(
         truncate_bash_history(bash_history_length)
 
 
+def create_filesystem_snapshot(task_state: TaskState) -> FilesystemSnapshot | None:
+    try:
+        root = Path(task_state._task.get_working_directory()).resolve()
+    except Exception as exc:
+        logger.warning(f"[ActionHook] Could not resolve task working directory: {exc}")
+        return None
+    if not root.exists() or not root.is_dir():
+        logger.warning(f"[ActionHook] Working directory is not a directory: {root}")
+        return None
+
+    snapshot_parent = Path(tempfile.mkdtemp(prefix="useagent-action-hook-fs-"))
+    snapshot_root = snapshot_parent / "tree"
+    try:
+        _copy_tree_contents(root, snapshot_root)
+    except Exception as exc:
+        logger.warning(f"[ActionHook] Could not create filesystem snapshot: {exc}")
+        shutil.rmtree(snapshot_parent, ignore_errors=True)
+        return None
+    return FilesystemSnapshot(root=root, snapshot_root=snapshot_root)
+
+
+def restore_filesystem_snapshot(snapshot: FilesystemSnapshot) -> None:
+    root = snapshot.root
+    if not root.exists():
+        root.mkdir(parents=True)
+
+    for child in root.iterdir():
+        if child.name == ".git":
+            continue
+        _remove_path(child)
+
+    if snapshot.snapshot_root.exists():
+        _copy_tree_contents(snapshot.snapshot_root, root)
+
+
+def cleanup_filesystem_snapshot(snapshot: FilesystemSnapshot) -> None:
+    shutil.rmtree(snapshot.snapshot_root.parent, ignore_errors=True)
+
+
+def _copy_tree_contents(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        if child.name == ".git":
+            continue
+        target = destination / child.name
+        if child.is_dir() and not child.is_symlink():
+            shutil.copytree(child, target, symlinks=True)
+        else:
+            shutil.copy2(child, target, follow_symlinks=False)
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def configure_action_hook_policy_from_environment(
+    *,
+    allow_restore: bool | None = None,
+    restore_actions_value: str | None = None,
+) -> None:
+    if allow_restore is None:
+        allow_restore = _env_flag("USEAGENT_ACTION_HOOK_ALLOW_RESTORE", default=True)
+    if restore_actions_value is None:
+        restore_actions_value = os.environ.get("USEAGENT_ACTION_HOOK_RESTORE_ACTIONS")
+    restore_actions: frozenset[TopLevelActionName] | None = None
+    if restore_actions_value:
+        values: set[TopLevelActionName] = set()
+        allowed_actions = set(cast(tuple[str, ...], TopLevelActionName.__args__))
+        for raw in restore_actions_value.split(","):
+            action = raw.strip()
+            if not action:
+                continue
+            if action not in allowed_actions:
+                raise ValueError(
+                    "USEAGENT_ACTION_HOOK_RESTORE_ACTIONS contains unknown "
+                    f"top-level action: {action}"
+                )
+            values.add(cast(TopLevelActionName, action))
+        restore_actions = frozenset(values)
+    ACTION_HOOK_MANAGER.configure_policy(
+        ActionHookPolicy(
+            allow_restore=allow_restore,
+            restore_actions=restore_actions,
+        )
+    )
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 ACTION_HOOK_MANAGER = ActionHookManager()
 
 
 def load_action_hook_spec(spec: str) -> ActionHook:
+    if spec.strip().startswith("command:"):
+        return _load_command_hook_spec(spec.strip()[len("command:") :].strip())
+
     module_ref, separator, attr_path = spec.strip().partition(":")
     if not separator or not module_ref or not attr_path:
         raise ValueError(
-            "Action hook specs must use 'module:function' or "
-            "'/path/to/file.py:function'"
+            "Action hook specs must use 'module:function', "
+            "'/path/to/file.py:function', or 'command:<shell command>'"
         )
 
     if module_ref.endswith(".py") or "/" in module_ref:
@@ -381,3 +693,136 @@ def _load_module_from_file(module_ref: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_command_hook_spec(command: str) -> ActionHook:
+    if not command:
+        raise ValueError("Command action hook specs must include a command")
+
+    async def command_hook(
+        event: ActionHookEvent,
+        token: HookCancellationToken,
+    ) -> HookDecision | None:
+        if token.cancelled:
+            return None
+
+        payload = _safe_jsonable(
+            {
+                "schema_version": 1,
+                "event": _event_payload(event),
+            }
+        )
+        logger.debug(f"[ActionHook] Running command hook: {command}")
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(json.dumps(payload).encode("utf-8")),
+                timeout=constants.ACTION_HOOK_COMMAND_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            logger.warning(
+                "[ActionHook] Command hook timed out after "
+                f"{constants.ACTION_HOOK_COMMAND_TIMEOUT_SECONDS}s: {command}"
+            )
+            return HookDecision.noop("command hook timed out")
+
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0:
+            logger.warning(
+                "[ActionHook] Command hook failed with exit code "
+                f"{proc.returncode}: {command}\n{stderr_text}"
+            )
+            return HookDecision.noop(
+                f"command hook failed with exit code {proc.returncode}"
+            )
+
+        output = stdout.decode("utf-8", errors="replace").strip()
+        if not output or token.cancelled:
+            return None
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError as exc:
+            logger.warning(f"[ActionHook] Command hook returned invalid JSON: {exc}")
+            return HookDecision.noop("command hook returned invalid JSON")
+        return _decision_from_payload(data)
+
+    command_hook.__name__ = f"command_hook:{shlex.split(command)[0] if command else ''}"
+    return command_hook
+
+
+def _event_payload(event: ActionHookEvent) -> dict[str, Any]:
+    return {
+        "action_name": event.action_name,
+        "action_args": event.action_args,
+        "result": event.result,
+        "error": (
+            None
+            if event.error is None
+            else {
+                "type": type(event.error).__name__,
+                "message": str(event.error),
+            }
+        ),
+        "checkpoint": {
+            "id": event.checkpoint.id,
+            "action_name": event.checkpoint.action_name,
+            "generation": event.checkpoint.generation,
+            "created_at": event.checkpoint.created_at.isoformat(),
+        },
+        "task_state": event.current_task_state,
+        "task_state_summary": event.current_task_state.to_model_repr(),
+        "bash_history_length": event.current_bash_history_length,
+        "has_filesystem_snapshot": event.current_filesystem_snapshot is not None,
+    }
+
+
+def _decision_from_payload(data: Any) -> HookDecision | None:
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        raise ValueError("Command hook JSON response must be an object")
+    kind = data.get("kind", "noop")
+    if kind == "noop":
+        return HookDecision.noop(_optional_str(data.get("reason")))
+    if kind == "intervene":
+        instruction = data.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ValueError("Command hook intervention needs a string instruction")
+        additional_knowledge = data.get("additional_knowledge") or {}
+        if not isinstance(additional_knowledge, dict):
+            raise ValueError("additional_knowledge must be an object")
+        return HookDecision.intervene(
+            instruction,
+            reason=_optional_str(data.get("reason")),
+            additional_knowledge={
+                str(key): str(value) for key, value in additional_knowledge.items()
+            },
+            restore_to_checkpoint=bool(data.get("restore_to_checkpoint", True)),
+        )
+    raise ValueError(f"Unknown command hook decision kind: {kind}")
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _safe_jsonable(value: Any) -> Any:
+    try:
+        return to_jsonable_python(value)
+    except Exception:
+        return json.loads(json.dumps(value, default=str))
+
+
+def _hook_name(hook: ActionHook) -> str:
+    module = getattr(hook, "__module__", "")
+    name = getattr(hook, "__qualname__", getattr(hook, "__name__", repr(hook)))
+    return f"{module}.{name}" if module else name

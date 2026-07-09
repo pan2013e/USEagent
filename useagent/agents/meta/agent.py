@@ -18,6 +18,7 @@ from useagent.action_hooks import (
     ACTION_HOOK_MANAGER,
     ActionIntervention,
     ActionInterventionRequest,
+    restore_filesystem_snapshot,
     restore_task_state_from_checkpoint,
     restore_task_state_from_snapshot,
 )
@@ -95,7 +96,7 @@ def _apply_action_hook_intervention(
         "[ActionHook] Applying intervention from checkpoint "
         f"{request.checkpoint.id} after {request.checkpoint.action_name}"
     )
-    ACTION_HOOK_MANAGER.reset_runtime()
+    ACTION_HOOK_MANAGER.reset_runtime(preserve_snapshot_id=request.checkpoint.id)
     if request.decision.restore_to_checkpoint:
         if request.restore_task_state is None:
             restore_task_state_from_checkpoint(task_state, request.checkpoint)
@@ -105,7 +106,18 @@ def _apply_action_hook_intervention(
                 request.restore_task_state,
                 bash_history_length=request.restore_bash_history_length,
             )
+        if request.restore_filesystem_snapshot is not None:
+            restore_filesystem_snapshot(request.restore_filesystem_snapshot)
+    ACTION_HOOK_MANAGER.cleanup_filesystem_snapshot(request.checkpoint.id)
     task_state.additional_knowledge.update(request.decision.additional_knowledge)
+    ACTION_HOOK_MANAGER.record_diagnostic(
+        "intervention_applied",
+        action_name=request.checkpoint.action_name,
+        checkpoint_id=request.checkpoint.id,
+        restore_to_checkpoint=request.decision.restore_to_checkpoint,
+        restored_filesystem=request.restore_filesystem_snapshot is not None
+        and request.decision.restore_to_checkpoint,
+    )
     return intervention_count, _format_action_hook_intervention_instruction(request)
 
 
