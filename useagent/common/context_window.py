@@ -45,6 +45,24 @@ GEMMA_3_TOKENIZER_PATH = (
     Path(__file__).parent / "tokenizers" / "gemma-3-4b-it"
 ).absolute()
 
+O200K_BASE_MODEL_NAMES = {
+    "gpt-5.5",
+    "gpt-5.5-pro",
+    "gpt-5.4",
+    "gpt-5.4-pro",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+    "gpt-5.2-pro",
+    "gpt-5.2-codex",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-5-codex",
+    "gpt-5-chat-latest",
+}
+
 
 async def fit_messages_into_context_window(
     messages: list[ModelMessage],
@@ -828,12 +846,15 @@ def _lookup_tokenizer_for_google_models(
 def _lookup_tiktoken_encoding(model_descriptor: str) -> Encoding:
     # See Tiktokens Github Repository: https://github.com/openai/tiktoken
     # And particularly their Encoding Lookup: https://github.com/openai/tiktoken/blob/main/tiktoken/model.py
+    _model_descriptor: str = (
+        model_descriptor[len("openai:") :]
+        if model_descriptor.startswith("openai:")
+        else model_descriptor
+    )
+    if _model_descriptor in O200K_BASE_MODEL_NAMES:
+        return tiktoken.get_encoding("o200k_base")
+
     try:
-        _model_descriptor: str = (
-            model_descriptor[len("openai:") :]
-            if model_descriptor.startswith("openai:")
-            else model_descriptor
-        )
         # TODO: Better lookup here, our model names will likely not match
         encoder = tiktoken.encoding_for_model(_model_descriptor)
 

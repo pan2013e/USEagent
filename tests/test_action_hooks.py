@@ -4,7 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic_ai import RunContext
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 
@@ -23,6 +29,7 @@ from useagent.action_hooks import (
     load_action_hook_spec,
     parse_action_hook_spec_list,
     restore_task_state_from_checkpoint,
+    restore_task_state_from_snapshot,
 )
 from useagent.pydantic_models.task_state import TaskState
 from useagent.state.git_repo import GitRepository
@@ -81,6 +88,7 @@ async def test_load_action_hook_spec_from_external_file(tmp_path):
             error=None,
             checkpoint=checkpoint,
             current_task_state=ctx.deps,
+            current_bash_history_length=0,
         ),
         HookCancellationToken(),
     )
@@ -264,33 +272,69 @@ def test_restore_task_state_from_checkpoint_restores_in_memory_state(tmp_path):
     assert "speculative" not in ctx.deps.additional_knowledge
 
 
-def test_intervention_message_history_drops_unprocessed_tool_call(tmp_path):
+def test_restore_task_state_from_snapshot_preserves_post_action_state(tmp_path):
+    ctx = make_context(tmp_path)
+    snapshot = TaskState(task=ctx.deps._task, git_repo=ctx.deps._git_repo)
+    snapshot.additional_knowledge["post_action"] = "preserved"
+    ctx.deps.additional_knowledge["post_action"] = "speculative"
+
+    restore_task_state_from_snapshot(ctx.deps, snapshot, bash_history_length=None)
+
+    assert ctx.deps.additional_knowledge == {"post_action": "preserved"}
+
+
+def test_restore_intervention_message_history_preserves_completed_action(tmp_path):
     ctx = make_context(tmp_path)
     initial_user_message = ModelRequest(parts=[])
-    pending_tool_call = ModelResponse(
+    probe_tool_call = ModelResponse(
         parts=[
-            TextPart(content="I will search."),
+            ToolCallPart(
+                tool_name="probe_environment",
+                args={},
+                tool_call_id="call-probe",
+            ),
+        ]
+    )
+    probe_tool_return = ModelRequest(
+        parts=[
+            ToolReturnPart(
+                tool_name="probe_environment",
+                content="Environment detected.",
+                tool_call_id="call-probe",
+            ),
+        ]
+    )
+    pending_next_action = ModelResponse(
+        parts=[
             ToolCallPart(
                 tool_name="search_code",
                 args={"instruction": "find relevant code"},
-                tool_call_id="call-1",
+                tool_call_id="call-next",
             ),
         ]
     )
     request = ActionInterventionRequest(
         checkpoint=ActionCheckpoint(
             id="checkpoint",
-            action_name="search_code",
+            action_name="probe_environment",
             task_state=ctx.deps,
-            messages=[initial_user_message, pending_tool_call],
+            messages=[initial_user_message],
             bash_history_length=0,
             generation=0,
         ),
-        decision=HookDecision.intervene("Try a narrower search."),
+        decision=HookDecision.intervene("Use the probe result before searching."),
+        replay_messages=[
+            initial_user_message,
+            probe_tool_call,
+            probe_tool_return,
+            pending_next_action,
+        ],
     )
 
     assert meta_agent_module._message_history_for_action_hook_intervention(request) == [
-        initial_user_message
+        initial_user_message,
+        probe_tool_call,
+        probe_tool_return,
     ]
 
 
@@ -323,6 +367,70 @@ def test_non_restore_intervention_keeps_completed_message_history(tmp_path):
         )
         == completed_messages
     )
+
+
+def test_non_restore_intervention_uses_interrupted_message_history(tmp_path):
+    ctx = make_context(tmp_path)
+    checkpoint_message = ModelRequest(parts=[])
+    completed_probe_message = ModelResponse(parts=[TextPart(content="Probe complete.")])
+    pending_next_action = ModelResponse(
+        parts=[
+            ToolCallPart(
+                tool_name="search_code",
+                args={"instruction": "find relevant code"},
+                tool_call_id="call-next",
+            )
+        ]
+    )
+    request = ActionInterventionRequest(
+        checkpoint=ActionCheckpoint(
+            id="checkpoint",
+            action_name="probe_environment",
+            task_state=ctx.deps,
+            messages=[checkpoint_message],
+            bash_history_length=0,
+            generation=0,
+        ),
+        decision=HookDecision.intervene(
+            "Continue from current state.",
+            restore_to_checkpoint=False,
+        ),
+        replay_messages=[
+            checkpoint_message,
+            completed_probe_message,
+            pending_next_action,
+        ],
+    )
+
+    assert meta_agent_module._message_history_for_action_hook_intervention(request) == [
+        checkpoint_message,
+        completed_probe_message,
+    ]
+
+
+def test_pending_intervention_captures_interrupted_history(tmp_path):
+    ctx = make_context(tmp_path)
+    current_message = ModelRequest(parts=[])
+    manager = ActionHookManager()
+    manager._intervention = ActionInterventionRequest(
+        checkpoint=ActionCheckpoint(
+            id="checkpoint",
+            action_name="probe_environment",
+            task_state=ctx.deps,
+            messages=[],
+            bash_history_length=0,
+            generation=0,
+        ),
+        decision=HookDecision.intervene(
+            "Continue from current state.",
+            restore_to_checkpoint=False,
+        ),
+    )
+
+    with pytest.raises(ActionIntervention) as exc_info:
+        manager.raise_if_intervention(current_messages=[current_message])
+
+    assert exc_info.value.request.replay_messages == [current_message]
 
 
 @pytest.mark.asyncio

@@ -59,6 +59,7 @@ class ActionHookEvent:
     error: BaseException | None
     checkpoint: ActionCheckpoint
     current_task_state: TaskState
+    current_bash_history_length: int
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,9 @@ ActionHook = Callable[
 class ActionInterventionRequest:
     checkpoint: ActionCheckpoint
     decision: HookDecision
+    replay_messages: list[ModelMessage] | None = None
+    restore_task_state: TaskState | None = None
+    restore_bash_history_length: int | None = None
 
 
 class ActionIntervention(Exception):
@@ -161,7 +165,7 @@ class ActionHookManager:
         action_name: TopLevelActionName,
         ctx: RunContext[TaskState],
     ) -> ActionCheckpoint | None:
-        self.raise_if_intervention()
+        self.raise_if_intervention(current_messages=ctx.messages)
         if not self.has_hooks:
             return None
         return ActionCheckpoint(
@@ -191,7 +195,8 @@ class ActionHookManager:
             result=result,
             error=error,
             checkpoint=checkpoint,
-            current_task_state=current_task_state,
+            current_task_state=copy.deepcopy(current_task_state),
+            current_bash_history_length=len(get_bash_history()),
         )
         for hook in list(self._hooks):
             token = HookCancellationToken()
@@ -207,9 +212,19 @@ class ActionHookManager:
         self._intervention = None
         return request
 
-    def raise_if_intervention(self) -> None:
+    def raise_if_intervention(
+        self, current_messages: list[ModelMessage] | None = None
+    ) -> None:
         request = self.pop_intervention()
         if request is not None:
+            if current_messages is not None:
+                request = ActionInterventionRequest(
+                    checkpoint=request.checkpoint,
+                    decision=request.decision,
+                    replay_messages=copy.deepcopy(current_messages),
+                    restore_task_state=request.restore_task_state,
+                    restore_bash_history_length=request.restore_bash_history_length,
+                )
             raise ActionIntervention(request)
 
     def cancel_pending(self) -> None:
@@ -267,6 +282,8 @@ class ActionHookManager:
             self._intervention = ActionInterventionRequest(
                 checkpoint=event.checkpoint,
                 decision=decision,
+                restore_task_state=event.current_task_state,
+                restore_bash_history_length=event.current_bash_history_length,
             )
             logger.info(
                 "[ActionHook] Queued intervention after "
@@ -277,14 +294,41 @@ class ActionHookManager:
 def restore_task_state_from_checkpoint(
     target: TaskState, checkpoint: ActionCheckpoint
 ) -> None:
-    source = copy.deepcopy(checkpoint.task_state)
+    _restore_task_state(
+        target,
+        checkpoint.task_state,
+        bash_history_length=checkpoint.bash_history_length,
+    )
+
+
+def restore_task_state_from_snapshot(
+    target: TaskState,
+    source: TaskState,
+    *,
+    bash_history_length: int | None,
+) -> None:
+    _restore_task_state(
+        target,
+        source,
+        bash_history_length=bash_history_length,
+    )
+
+
+def _restore_task_state(
+    target: TaskState,
+    source: TaskState,
+    *,
+    bash_history_length: int | None,
+) -> None:
+    source = copy.deepcopy(source)
     target.code_locations = source.code_locations
     target.test_locations = source.test_locations
     target.diff_store = source.diff_store
     target.active_environment = source.active_environment
     target.known_environments = source.known_environments
     target.additional_knowledge = source.additional_knowledge
-    truncate_bash_history(checkpoint.bash_history_length)
+    if bash_history_length is not None:
+        truncate_bash_history(bash_history_length)
 
 
 ACTION_HOOK_MANAGER = ActionHookManager()

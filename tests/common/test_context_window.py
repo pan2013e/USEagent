@@ -56,6 +56,23 @@ def test_lookup_tokenizer_for_known_google_gemini_20():
     assert isinstance(tokenizer, SentencePieceProcessor)
 
 
+@pytest.mark.parametrize("model_descriptor", ["gpt-5.4", "openai:gpt-5.4"])
+def test_lookup_tiktoken_encoding_for_current_openai_models_without_fallback_log(
+    monkeypatch: pytest.MonkeyPatch,
+    model_descriptor: str,
+):
+    debug_messages: list[str] = []
+    monkeypatch.setattr(
+        "useagent.common.context_window.logger.debug", debug_messages.append
+    )
+
+    encoding = _lookup_tiktoken_encoding(model_descriptor)
+
+    assert isinstance(encoding, Encoding)
+    assert encoding.name == "o200k_base"
+    assert debug_messages == []
+
+
 def test_fit_into_context_window_with_a_supported_model_short_message_should_be_kept():
     tokenizer = _lookup_tokenizer_for_google_models("google-gla:gemini-2.5-flash ")
     message = "Hello World"

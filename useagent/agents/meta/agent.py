@@ -3,7 +3,13 @@ from typing import Literal
 
 from loguru import logger
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.messages import BaseToolCallPart, ModelMessage, ModelResponse
+from pydantic_ai.messages import (
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+)
 from pydantic_ai.tools import Tool
 from pydantic_ai.usage import UsageLimits
 
@@ -13,6 +19,7 @@ from useagent.action_hooks import (
     ActionIntervention,
     ActionInterventionRequest,
     restore_task_state_from_checkpoint,
+    restore_task_state_from_snapshot,
 )
 from useagent.common.context_window import fit_messages_into_context_window
 from useagent.config import AppConfig, ConfigSingleton
@@ -78,7 +85,7 @@ def _apply_action_hook_intervention(
         )
         logger.warning(
             "[ActionHook] Ignoring intervention from checkpoint "
-            f"{request.checkpoint.id} before {request.checkpoint.action_name}; "
+            f"{request.checkpoint.id} after {request.checkpoint.action_name}; "
             f"{reason}. Future interventions will be ignored for this agent loop."
         )
         ACTION_HOOK_MANAGER.ignore_future_interventions(reason)
@@ -86,11 +93,18 @@ def _apply_action_hook_intervention(
 
     logger.info(
         "[ActionHook] Applying intervention from checkpoint "
-        f"{request.checkpoint.id} before {request.checkpoint.action_name}"
+        f"{request.checkpoint.id} after {request.checkpoint.action_name}"
     )
     ACTION_HOOK_MANAGER.reset_runtime()
     if request.decision.restore_to_checkpoint:
-        restore_task_state_from_checkpoint(task_state, request.checkpoint)
+        if request.restore_task_state is None:
+            restore_task_state_from_checkpoint(task_state, request.checkpoint)
+        else:
+            restore_task_state_from_snapshot(
+                task_state,
+                request.restore_task_state,
+                bash_history_length=request.restore_bash_history_length,
+            )
     task_state.additional_knowledge.update(request.decision.additional_knowledge)
     return intervention_count, _format_action_hook_intervention_instruction(request)
 
@@ -99,9 +113,50 @@ def _message_history_for_action_hook_intervention(
     request: ActionInterventionRequest,
     completed_messages: list[ModelMessage] | None = None,
 ) -> list[ModelMessage]:
-    if completed_messages is not None and not request.decision.restore_to_checkpoint:
-        return completed_messages
+    if not request.decision.restore_to_checkpoint:
+        if completed_messages is not None:
+            return completed_messages
+        if request.replay_messages is not None:
+            return _drop_trailing_tool_call_messages(request.replay_messages)
+    if request.replay_messages is not None:
+        return _message_history_through_action(
+            request.replay_messages,
+            request.checkpoint.action_name,
+        )
+    if completed_messages is not None:
+        return _message_history_through_action(
+            completed_messages,
+            request.checkpoint.action_name,
+        )
     return _drop_trailing_tool_call_messages(request.checkpoint.messages)
+
+
+def _message_history_through_action(
+    messages: list[ModelMessage],
+    action_name: str,
+) -> list[ModelMessage]:
+    action_call_ids: set[str] = set()
+    last_action_return_index: int | None = None
+
+    for index, message in enumerate(messages):
+        if isinstance(message, ModelResponse):
+            for part in message.parts or []:
+                if (
+                    isinstance(part, BaseToolCallPart)
+                    and part.tool_name == action_name
+                ):
+                    action_call_ids.add(part.tool_call_id)
+        elif isinstance(message, ModelRequest) and action_call_ids:
+            if any(
+                isinstance(part, BaseToolReturnPart)
+                and part.tool_call_id in action_call_ids
+                for part in message.parts or []
+            ):
+                last_action_return_index = index
+
+    if last_action_return_index is None:
+        return _drop_trailing_tool_call_messages(messages)
+    return messages[: last_action_return_index + 1]
 
 
 def _drop_trailing_tool_call_messages(
@@ -430,15 +485,26 @@ def _format_action_hook_intervention_instruction(
 ) -> str:
     decision = request.decision
     reason = decision.reason or "No reason was provided."
+    if decision.restore_to_checkpoint:
+        replay_description = f"""
+    The agent trajectory has been restored to the state immediately after
+    `{request.checkpoint.action_name}` completed. In-memory TaskState, message
+    history, and recorded bash history preserve that action and exclude later
+    actions. External filesystem or process side effects are not rolled back.
+    """
+    else:
+        replay_description = f"""
+    The agent trajectory has not been restored to the checkpoint captured before
+    `{request.checkpoint.action_name}`. Continue from the current post-action
+    state. If this intervention interrupted a newly requested action, only that
+    pending action was removed from message history before replay.
+    """
     return f"""
     A non-blocking hook that runs after top-level USEagent actions has completed
     analysis of the `{request.checkpoint.action_name}` action and requested an
     intervention.
 
-    The agent trajectory has been restored to the checkpoint captured before
-    that action if the hook requested checkpoint restore. The rollback covers
-    in-memory TaskState, message history, and recorded bash history. It does not
-    roll back external filesystem or process side effects.
+    {replay_description}
 
     Hook reason:
     {reason}
