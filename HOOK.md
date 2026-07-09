@@ -5,11 +5,18 @@ Meta-Agent actions. They are useful for adding project-specific checks,
 policy feedback, trace inspection, or guardrail feedback without modifying the
 agent loop itself.
 
-Hooks are non-blocking from the agent's point of view: after a top-level action
-finishes, USEagent schedules registered hooks in the background and the agent is
-allowed to continue. If a hook later requests an intervention, the agent
-cooperatively stops at the next top-level action boundary, restores the saved
-post-action checkpoint when allowed, and resumes with the hook's instruction.
+Hooks are non-blocking by default: after a top-level action finishes, USEagent
+schedules registered hooks in the background and the agent is allowed to
+continue. When `USEAGENT_ACTION_HOOK_WAIT_SECONDS` is greater than zero,
+USEagent waits up to that many seconds for the hooks attached to the completed
+action before returning control to the model. This is useful for feedback hooks
+that must intervene before the model chooses another action.
+
+If a hook requests an intervention in time, the agent cooperatively stops at the
+next top-level action boundary, restores the saved post-action checkpoint when
+allowed, and resumes with the hook's instruction. If the configured wait budget
+expires, still-running hooks for that checkpoint are cancelled so stale feedback
+from an old action cannot interrupt a later step.
 
 ## Hooked Actions
 
@@ -172,6 +179,18 @@ Environment variable equivalents:
 
 When restore is disallowed, an intervention continues from the current state
 instead of rolling back.
+
+## Timing Controls
+
+Hook wait behavior is controlled by environment variable:
+
+- `USEAGENT_ACTION_HOOK_WAIT_SECONDS`: seconds to wait after each top-level
+  action for that action's hooks to complete. The default is `0`, preserving
+  fully non-blocking behavior.
+
+Command hooks have their own execution timeout from USEagent constants. Python
+hooks should still check `token.cancelled` before and after expensive work so
+they can stop quickly when a run ends or a wait budget expires.
 
 ## Command Hooks
 

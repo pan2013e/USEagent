@@ -1,9 +1,10 @@
 # Top-Level Action Hooks
 
-This document tracks the implementation status for non-blocking hooks that run
-after USEagent top-level actions. These hooks are intentionally scoped to the
-Meta-Agent action wrappers only, not low-level tools such as bash, file edit, or
-git helpers.
+This document tracks the implementation status for post-action hooks that run
+after USEagent top-level actions. They are non-blocking by default and can be
+configured to wait briefly after an action when immediate feedback is required.
+These hooks are intentionally scoped to the Meta-Agent action wrappers only, not
+low-level tools such as bash, file edit, or git helpers.
 
 ## Scope
 
@@ -56,6 +57,8 @@ Out of scope:
   intervention restore behavior including repeated-action replay, filesystem
   restore, command hooks, policy downgrade, mid-action cancellation, and
   uncaught-exception hook events.
+- [x] Optional post-action hook wait via `USEAGENT_ACTION_HOOK_WAIT_SECONDS`,
+  with timed-out checkpoint hooks cancelled to avoid stale later interventions.
 
 ## Still Needed
 
@@ -64,15 +67,22 @@ Limitations for behavior that remains intentionally scoped.
 
 ## Design Notes
 
-Hooks are LSP-like advisory workers: they should run in the background and
-return either no action or an intervention request. Interventions are cooperative
-at top-level action boundaries. If a hook requests intervention, the agent loop
-restores the post-action snapshot captured immediately after the triggering
-action completed, cancels remaining hook jobs, and resumes the Meta-Agent with
-the hook-provided instruction. This preserves the triggering action and removes
-later action attempts from replay. Message replay is anchored at the triggering
-checkpoint, so a delayed hook for an earlier `search_code` action does not keep
-later `search_code` calls merely because they share the same tool name.
+Hooks are LSP-like advisory workers: they normally run in the background and
+return either no action or an intervention request. With
+`USEAGENT_ACTION_HOOK_WAIT_SECONDS=0`, top-level actions return immediately after
+scheduling hooks. With a positive value, the action wrapper waits up to that many
+seconds for hooks from the completed action before returning control to the
+model. Timed-out hooks for that checkpoint are cancelled, preventing stale
+feedback from an earlier action from interrupting a later step.
+
+Interventions are cooperative at top-level action boundaries. If a hook requests
+intervention, the agent loop restores the post-action snapshot captured
+immediately after the triggering action completed, cancels remaining hook jobs,
+and resumes the Meta-Agent with the hook-provided instruction. This preserves
+the triggering action and removes later action attempts from replay. Message
+replay is anchored at the triggering checkpoint, so a delayed hook for an
+earlier `search_code` action does not keep later `search_code` calls merely
+because they share the same tool name.
 
 The current rollback restores in-memory `TaskState`, saved message history,
 recorded bash history length, task working-tree files, and local VCS state. For
