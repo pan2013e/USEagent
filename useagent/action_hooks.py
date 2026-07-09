@@ -10,6 +10,7 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -51,7 +52,19 @@ class ActionCheckpoint:
 class FilesystemSnapshot:
     root: Path
     snapshot_root: Path
+    strategy: Literal["git", "full"] = "full"
+    git_snapshot: GitFilesystemSnapshot | None = None
     created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass(frozen=True)
+class GitFilesystemSnapshot:
+    head_sha: str
+    symbolic_head: str | None
+    refs: dict[str, str]
+    staged_patch: Path
+    unstaged_patch: Path
+    untracked_root: Path
 
 
 @dataclass(frozen=True)
@@ -257,7 +270,9 @@ class ActionHookManager:
         if checkpoint is None or not self.has_hooks:
             return
 
-        filesystem_snapshot = create_filesystem_snapshot(current_task_state)
+        filesystem_snapshot = None
+        if self._policy.allows_restore(checkpoint.action_name):
+            filesystem_snapshot = create_filesystem_snapshot(current_task_state)
         if filesystem_snapshot is not None:
             self._filesystem_snapshots[checkpoint.id] = filesystem_snapshot
         self._checkpoint_pending_counts[checkpoint.id] = len(self._hooks)
@@ -266,6 +281,9 @@ class ActionHookManager:
             action_name=checkpoint.action_name,
             checkpoint_id=checkpoint.id,
             has_filesystem_snapshot=filesystem_snapshot is not None,
+            filesystem_snapshot_strategy=(
+                filesystem_snapshot.strategy if filesystem_snapshot is not None else None
+            ),
             error_type=type(error).__name__ if error is not None else None,
         )
         event = ActionHookEvent(
@@ -553,6 +571,10 @@ def create_filesystem_snapshot(task_state: TaskState) -> FilesystemSnapshot | No
         logger.warning(f"[ActionHook] Working directory is not a directory: {root}")
         return None
 
+    git_snapshot = create_git_filesystem_snapshot(root)
+    if git_snapshot is not None:
+        return git_snapshot
+
     snapshot_parent = Path(tempfile.mkdtemp(prefix="useagent-action-hook-fs-"))
     snapshot_root = snapshot_parent / "tree"
     try:
@@ -565,13 +587,17 @@ def create_filesystem_snapshot(task_state: TaskState) -> FilesystemSnapshot | No
 
 
 def restore_filesystem_snapshot(snapshot: FilesystemSnapshot) -> None:
+    if snapshot.strategy == "git":
+        if snapshot.git_snapshot is None:
+            raise RuntimeError("Git filesystem snapshot metadata is missing")
+        restore_git_filesystem_snapshot(snapshot)
+        return
+
     root = snapshot.root
     if not root.exists():
         root.mkdir(parents=True)
 
     for child in root.iterdir():
-        if child.name == ".git":
-            continue
         _remove_path(child)
 
     if snapshot.snapshot_root.exists():
@@ -582,11 +608,86 @@ def cleanup_filesystem_snapshot(snapshot: FilesystemSnapshot) -> None:
     shutil.rmtree(snapshot.snapshot_root.parent, ignore_errors=True)
 
 
+def create_git_filesystem_snapshot(root: Path) -> FilesystemSnapshot | None:
+    if not (root / ".git").is_dir():
+        return None
+
+    toplevel = _git_output(root, "rev-parse", "--show-toplevel", check=False)
+    if toplevel is None or Path(toplevel).resolve() != root:
+        return None
+
+    head_sha = _git_output(root, "rev-parse", "--verify", "HEAD", check=False)
+    if head_sha is None:
+        return None
+
+    snapshot_parent = Path(tempfile.mkdtemp(prefix="useagent-action-hook-git-"))
+    snapshot_root = snapshot_parent / "git"
+    snapshot_root.mkdir(parents=True)
+    try:
+        staged_patch = snapshot_root / "staged.patch"
+        unstaged_patch = snapshot_root / "unstaged.patch"
+        staged_patch.write_bytes(
+            _git_bytes(root, "diff", "--binary", "--full-index", "--cached")
+        )
+        unstaged_patch.write_bytes(
+            _git_bytes(root, "diff", "--binary", "--full-index")
+        )
+        untracked_root = snapshot_root / "untracked"
+        _copy_untracked_files(root, untracked_root)
+        symbolic_head = _git_output(root, "symbolic-ref", "-q", "HEAD", check=False)
+        git_snapshot = GitFilesystemSnapshot(
+            head_sha=head_sha,
+            symbolic_head=symbolic_head,
+            refs=_read_git_refs(root),
+            staged_patch=staged_patch,
+            unstaged_patch=unstaged_patch,
+            untracked_root=untracked_root,
+        )
+        return FilesystemSnapshot(
+            root=root,
+            snapshot_root=snapshot_root,
+            strategy="git",
+            git_snapshot=git_snapshot,
+        )
+    except Exception as exc:
+        logger.warning(
+            f"[ActionHook] Could not create Git filesystem snapshot: {exc}"
+        )
+        shutil.rmtree(snapshot_parent, ignore_errors=True)
+        return None
+
+
+def restore_git_filesystem_snapshot(snapshot: FilesystemSnapshot) -> None:
+    git_snapshot = snapshot.git_snapshot
+    if git_snapshot is None:
+        raise RuntimeError("Git filesystem snapshot metadata is missing")
+
+    root = snapshot.root
+    if not root.exists():
+        root.mkdir(parents=True)
+
+    _git_run(root, "reset", "--hard")
+    _git_run(root, "clean", "-ffd")
+    _git_run(root, "checkout", "--detach", "--quiet", git_snapshot.head_sha)
+    _restore_git_refs(root, git_snapshot.refs)
+    if git_snapshot.symbolic_head is None:
+        _git_run(root, "checkout", "--detach", "--quiet", git_snapshot.head_sha)
+    else:
+        _git_run(root, "symbolic-ref", "HEAD", git_snapshot.symbolic_head)
+    _git_run(root, "reset", "--hard", git_snapshot.head_sha)
+    _git_run(root, "clean", "-ffd")
+
+    if git_snapshot.untracked_root.exists():
+        _copy_tree_contents(git_snapshot.untracked_root, root)
+    if git_snapshot.staged_patch.stat().st_size:
+        _git_apply(root, git_snapshot.staged_patch, "--index")
+    if git_snapshot.unstaged_patch.stat().st_size:
+        _git_apply(root, git_snapshot.unstaged_patch)
+
+
 def _copy_tree_contents(source: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     for child in source.iterdir():
-        if child.name == ".git":
-            continue
         target = destination / child.name
         if child.is_dir() and not child.is_symlink():
             shutil.copytree(child, target, symlinks=True)
@@ -599,6 +700,75 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
     else:
         path.unlink(missing_ok=True)
+
+
+def _copy_untracked_files(root: Path, destination: Path) -> None:
+    paths = _git_bytes(root, "ls-files", "--others", "--exclude-standard", "-z")
+    for raw_path in paths.split(b"\0"):
+        if not raw_path:
+            continue
+        relative = Path(os.fsdecode(raw_path))
+        source = root / relative
+        if not source.exists() and not source.is_symlink():
+            continue
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir() and not source.is_symlink():
+            shutil.copytree(source, target, symlinks=True, dirs_exist_ok=True)
+        else:
+            shutil.copy2(source, target, follow_symlinks=False)
+
+
+def _read_git_refs(root: Path) -> dict[str, str]:
+    output = _git_output(root, "for-each-ref", "--format=%(refname) %(objectname)")
+    refs: dict[str, str] = {}
+    for line in output.splitlines():
+        ref, sha = line.split(" ", 1)
+        refs[ref] = sha
+    return refs
+
+
+def _restore_git_refs(root: Path, saved_refs: dict[str, str]) -> None:
+    current_refs = _read_git_refs(root)
+    for ref in sorted(set(current_refs) - set(saved_refs)):
+        _git_run(root, "update-ref", "-d", ref)
+    for ref, sha in sorted(saved_refs.items()):
+        _git_run(root, "update-ref", ref, sha)
+
+
+def _git_apply(root: Path, patch: Path, *args: str) -> None:
+    _git_run(root, "apply", "--binary", *args, str(patch))
+
+
+def _git_output(root: Path, *args: str, check: bool = True) -> str | None:
+    result = _git_run(root, *args, check=check, text=True)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _git_bytes(root: Path, *args: str) -> bytes:
+    return _git_run(root, *args).stdout
+
+
+def _git_run(
+    root: Path,
+    *args: str,
+    check: bool = True,
+    text: bool = False,
+) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=root,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+    )
+    if check and result.returncode != 0:
+        stderr = result.stderr if text else result.stderr.decode("utf-8", "replace")
+        raise RuntimeError(f"git {' '.join(args)} failed: {stderr.strip()}")
+    return result
 
 
 def configure_action_hook_policy_from_environment(
@@ -780,6 +950,11 @@ def _event_payload(event: ActionHookEvent) -> dict[str, Any]:
         "task_state_summary": event.current_task_state.to_model_repr(),
         "bash_history_length": event.current_bash_history_length,
         "has_filesystem_snapshot": event.current_filesystem_snapshot is not None,
+        "filesystem_snapshot_strategy": (
+            event.current_filesystem_snapshot.strategy
+            if event.current_filesystem_snapshot is not None
+            else None
+        ),
     }
 
 

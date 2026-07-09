@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -59,6 +60,18 @@ def make_context(tmp_path) -> RunContext[TaskState]:
         usage=RunUsage(),
         messages=[],
     )
+
+
+def git(tmp_path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=tmp_path,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return result.stdout.strip()
 
 
 @pytest.mark.asyncio
@@ -292,18 +305,40 @@ def test_restore_filesystem_snapshot_restores_project_files(tmp_path):
     ctx = make_context(tmp_path)
     keep_file = tmp_path / "keep.txt"
     keep_file.write_text("after action")
+    original_head = git(tmp_path, "rev-parse", "HEAD")
+    original_branch = git(tmp_path, "branch", "--show-current")
     snapshot = create_filesystem_snapshot(ctx.deps)
     assert snapshot is not None
+    assert snapshot.strategy == "git"
+    assert snapshot.git_snapshot is not None
 
     try:
         keep_file.write_text("later action")
         (tmp_path / "later.txt").write_text("remove me")
+        git(tmp_path, "checkout", "-b", "later-branch")
+        committed_file = tmp_path / "committed.txt"
+        committed_file.write_text("committed after snapshot")
+        git(tmp_path, "add", "committed.txt")
+        git(tmp_path, "commit", "-m", "Commit after snapshot")
+        git(tmp_path, "tag", "later-tag")
+        assert git(tmp_path, "rev-parse", "HEAD") != original_head
+        staged_file = tmp_path / "staged.txt"
+        staged_file.write_text("staged after snapshot")
+        git(tmp_path, "add", "staged.txt")
+        assert "staged.txt" in git(tmp_path, "status", "--short")
 
         restore_filesystem_snapshot(snapshot)
 
         assert keep_file.read_text() == "after action"
         assert not (tmp_path / "later.txt").exists()
+        assert not committed_file.exists()
+        assert not staged_file.exists()
         assert (tmp_path / ".git").exists()
+        assert git(tmp_path, "rev-parse", "HEAD") == original_head
+        assert git(tmp_path, "branch", "--show-current") == original_branch
+        assert git(tmp_path, "branch", "--list", "later-branch") == ""
+        assert git(tmp_path, "tag", "--list", "later-tag") == ""
+        assert git(tmp_path, "status", "--short") == "?? keep.txt"
     finally:
         cleanup_filesystem_snapshot(snapshot)
 
@@ -360,6 +395,73 @@ def test_restore_intervention_message_history_preserves_completed_action(tmp_pat
         initial_user_message,
         probe_tool_call,
         probe_tool_return,
+    ]
+
+
+def test_restore_intervention_message_history_stops_at_triggering_repeated_action(
+    tmp_path,
+):
+    ctx = make_context(tmp_path)
+    initial_user_message = ModelRequest(parts=[])
+    first_search_call = ModelResponse(
+        parts=[
+            ToolCallPart(
+                tool_name="search_code",
+                args={"instruction": "first search"},
+                tool_call_id="call-search-1",
+            ),
+        ]
+    )
+    first_search_return = ModelRequest(
+        parts=[
+            ToolReturnPart(
+                tool_name="search_code",
+                content="First search result.",
+                tool_call_id="call-search-1",
+            ),
+        ]
+    )
+    later_search_call = ModelResponse(
+        parts=[
+            ToolCallPart(
+                tool_name="search_code",
+                args={"instruction": "later search"},
+                tool_call_id="call-search-2",
+            ),
+        ]
+    )
+    later_search_return = ModelRequest(
+        parts=[
+            ToolReturnPart(
+                tool_name="search_code",
+                content="Later search result.",
+                tool_call_id="call-search-2",
+            ),
+        ]
+    )
+    request = ActionInterventionRequest(
+        checkpoint=ActionCheckpoint(
+            id="checkpoint",
+            action_name="search_code",
+            task_state=ctx.deps,
+            messages=[initial_user_message],
+            bash_history_length=0,
+            generation=0,
+        ),
+        decision=HookDecision.intervene("Use the first search result."),
+        replay_messages=[
+            initial_user_message,
+            first_search_call,
+            first_search_return,
+            later_search_call,
+            later_search_return,
+        ],
+    )
+
+    assert meta_agent_module._message_history_for_action_hook_intervention(request) == [
+        initial_user_message,
+        first_search_call,
+        first_search_return,
     ]
 
 

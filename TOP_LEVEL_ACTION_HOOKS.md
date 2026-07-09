@@ -21,8 +21,8 @@ Out of scope:
 - Pydantic AI framework-level tool hooks.
 - Full runtime rollback of shell processes, installed dependencies, and
   filesystem changes outside the task working directory.
-- Git metadata rollback for `.git` contents such as commits, refs, and index
-  state.
+- Remote VCS side effects such as pushed commits, remote branch mutations, and
+  external repositories referenced by linked worktrees or submodules.
 
 ## Implemented
 
@@ -34,9 +34,11 @@ Out of scope:
 - [x] Cooperative intervention requests from completed hook runs.
 - [x] Meta-Agent loop support for restoring the state immediately after the
   triggering action completed, preserving that action while excluding later
-  actions from replay.
+  actions from replay, including later actions with the same top-level action
+  name.
 - [x] Project filesystem rollback for files under the task working directory,
-  excluding `.git` metadata and external process or dependency state.
+  using an optimized Git-aware snapshot for normal in-tree Git repositories and
+  a full-copy fallback otherwise.
 - [x] Cooperative mid-action cancellation at top-level action boundaries when a
   previously queued hook intervention is noticed while another action is
   running.
@@ -51,8 +53,9 @@ Out of scope:
 - [x] Hook scheduling for top-level actions that exit with uncaught exceptions,
   with the exception attached to the hook event.
 - [x] Tests for top-level-only scheduling, non-blocking execution, cancellation,
-  intervention restore behavior, filesystem restore, command hooks, policy
-  downgrade, mid-action cancellation, and uncaught-exception hook events.
+  intervention restore behavior including repeated-action replay, filesystem
+  restore, command hooks, policy downgrade, mid-action cancellation, and
+  uncaught-exception hook events.
 
 ## Still Needed
 
@@ -67,13 +70,19 @@ at top-level action boundaries. If a hook requests intervention, the agent loop
 restores the post-action snapshot captured immediately after the triggering
 action completed, cancels remaining hook jobs, and resumes the Meta-Agent with
 the hook-provided instruction. This preserves the triggering action and removes
-later action attempts from replay.
+later action attempts from replay. Message replay is anchored at the triggering
+checkpoint, so a delayed hook for an earlier `search_code` action does not keep
+later `search_code` calls merely because they share the same tool name.
 
 The current rollback restores in-memory `TaskState`, saved message history,
-recorded bash history length, and task working-tree files. Filesystem restore
-excludes `.git` metadata and does not restore shell process state, dependency
-installations, services, environment variables, or effects outside the task
-working directory.
+recorded bash history length, task working-tree files, and local VCS state. For
+normal in-tree Git repositories, snapshotting stores refs/HEAD, staged and
+unstaged binary patches, and untracked non-ignored files, then restores with Git
+plumbing instead of copying the whole repository. Non-Git and unusual Git
+layouts fall back to a full task-directory copy. Filesystem restore does not
+restore shell process state, dependency installations, services, environment
+variables, remote VCS side effects, or effects outside the task working
+directory.
 
 Mid-action cancellation is cooperative. USEagent polls for queued interventions
 while awaiting top-level sub-agent runs and cancels the current asyncio task when
@@ -83,8 +92,21 @@ scope above.
 
 ## Known Limitations
 
-- Filesystem rollback excludes `.git`, so commits, index mutations, refs, and
-  other VCS metadata changes are not rolled back.
+- Optimized Git rollback preserves tracked changes, staged changes, local
+  refs/HEAD, and untracked non-ignored files. Ignored files are not copied or
+  cleaned by the Git-aware path, so dependency directories and build caches are
+  intentionally left in place.
+- Git-aware restore assumes the repository's `.git` metadata still exists and
+  is usable when rollback runs. If a later action deletes or corrupts `.git`,
+  the optimized restore can fail because the snapshot does not contain a full
+  copy of the Git object database.
+- Uncommitted `.gitignore` changes can affect the boundary between ignored and
+  non-ignored untracked files. Files treated as ignored at snapshot time remain
+  outside Git-aware rollback even if later restored `.gitignore` content would
+  classify them differently.
+- Git rollback does not undo pushes, remote branch mutations, linked worktree
+  gitdirs outside the task directory, submodule repositories outside the copied
+  tree, or other external VCS effects.
 - Rollback does not undo package installations, running processes, remote
   service calls, or files outside the task working directory.
 - Mid-action cancellation depends on cooperative asyncio cancellation and may

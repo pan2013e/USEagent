@@ -134,11 +134,13 @@ def _message_history_for_action_hook_intervention(
         return _message_history_through_action(
             request.replay_messages,
             request.checkpoint.action_name,
+            start_index=len(request.checkpoint.messages),
         )
     if completed_messages is not None:
         return _message_history_through_action(
             completed_messages,
             request.checkpoint.action_name,
+            start_index=len(request.checkpoint.messages),
         )
     return _drop_trailing_tool_call_messages(request.checkpoint.messages)
 
@@ -146,11 +148,13 @@ def _message_history_for_action_hook_intervention(
 def _message_history_through_action(
     messages: list[ModelMessage],
     action_name: str,
+    *,
+    start_index: int = 0,
 ) -> list[ModelMessage]:
     action_call_ids: set[str] = set()
-    last_action_return_index: int | None = None
+    action_return_index: int | None = None
 
-    for index, message in enumerate(messages):
+    for index, message in enumerate(messages[start_index:], start=start_index):
         if isinstance(message, ModelResponse):
             for part in message.parts or []:
                 if (
@@ -164,11 +168,12 @@ def _message_history_through_action(
                 and part.tool_call_id in action_call_ids
                 for part in message.parts or []
             ):
-                last_action_return_index = index
+                action_return_index = index
+                break
 
-    if last_action_return_index is None:
+    if action_return_index is None:
         return _drop_trailing_tool_call_messages(messages)
-    return messages[: last_action_return_index + 1]
+    return messages[: action_return_index + 1]
 
 
 def _drop_trailing_tool_call_messages(
@@ -502,11 +507,13 @@ def _format_action_hook_intervention_instruction(
     The agent trajectory has been restored to the state immediately after
     `{request.checkpoint.action_name}` completed. In-memory TaskState, message
     history, and recorded bash history preserve that action and exclude later
-    actions. External filesystem or process side effects are not rolled back.
+    actions. Project filesystem state is restored when a filesystem snapshot was
+    available, within the documented rollback scope. Process, service, remote
+    VCS, and other external side effects are not rolled back.
     """
     else:
         replay_description = f"""
-    The agent trajectory has not been restored to the checkpoint captured before
+    The agent trajectory has not been restored to the checkpoint captured after
     `{request.checkpoint.action_name}`. Continue from the current post-action
     state. If this intervention interrupted a newly requested action, only that
     pending action was removed from message history before replay.
