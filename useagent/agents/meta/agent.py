@@ -40,7 +40,7 @@ from useagent.pydantic_models.provides_output_instructions import (
 from useagent.pydantic_models.task_state import TaskState
 from useagent.pydantic_models.tools.cliresult import CLIResult
 from useagent.pydantic_models.tools.errorinfo import ToolErrorInfo
-from useagent.state.usage_tracker import UsageTracker
+from useagent.state.usage_tracker import UsageTracker, usage_tracker_name
 from useagent.tasks.swebench_task import SWEbenchTask
 from useagent.tools.bash import (
     get_bash_history,
@@ -313,7 +313,10 @@ def agent_loop(
                 ),
                 message_history=message_history,
             )
-            USAGE_TRACKER.add(meta_agent.name, result.usage())
+            USAGE_TRACKER.add(
+                usage_tracker_name(meta_agent.name, "meta"),
+                result.usage(),
+            )
             request = ACTION_HOOK_MANAGER.pop_intervention()
             if request is not None:
                 completed_messages = result.all_messages()
@@ -424,7 +427,10 @@ def agent_loop(
                             ),
                             message_history=message_history,
                         )
-                        USAGE_TRACKER.add(meta_agent.name, result.usage())
+                        USAGE_TRACKER.add(
+                            usage_tracker_name(meta_agent.name, "meta"),
+                            result.usage(),
+                        )
                         request = ACTION_HOOK_MANAGER.pop_intervention()
                         if request is not None:
                             completed_messages = result.all_messages()

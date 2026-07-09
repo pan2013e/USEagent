@@ -3,7 +3,7 @@ import json
 import pytest
 from pydantic_ai.usage import RunUsage
 
-from useagent.state.usage_tracker import UsageTracker
+from useagent.state.usage_tracker import UsageTracker, usage_tracker_name
 
 
 def test_add_should_not_create_base_key_without_call_suffix() -> None:
@@ -33,6 +33,18 @@ def test_add_should_store_usage_with_incrementing_keys() -> None:
 
     assert tracker.usage["foo-call-no-1"].requests == 1
     assert tracker.usage["foo-call-no-2"].requests == 2
+
+
+def test_usage_tracker_name_should_accept_string_like_agent_names() -> None:
+    class AgentName:
+        def __str__(self) -> str:
+            return "edit"
+
+    assert usage_tracker_name(AgentName(), "fallback") == "edit"
+
+
+def test_usage_tracker_name_should_use_fallback_for_missing_agent_name() -> None:
+    assert usage_tracker_name(None, "edit_code") == "edit_code"
 
 
 def test_group_should_sum_usage_per_base_name() -> None:

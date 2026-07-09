@@ -21,6 +21,7 @@ from useagent.action_hooks import (
     ActionCheckpoint,
     ActionIntervention,
     TopLevelActionName,
+    action_hook_wait_seconds,
 )
 from useagent.agents.advisor.agent import init_agent as init_advisor_agent
 from useagent.agents.checklist.agent import (
@@ -48,7 +49,7 @@ from useagent.pydantic_models.info.environment import (
 from useagent.pydantic_models.task_state import TaskState
 from useagent.pydantic_models.tools.cliresult import CLIResult
 from useagent.pydantic_models.tools.errorinfo import ArgumentEntry, ToolErrorInfo
-from useagent.state.usage_tracker import UsageTracker
+from useagent.state.usage_tracker import UsageTracker, usage_tracker_name
 from useagent.tools.bash import get_bash_history
 
 USAGE_TRACKER: UsageTracker
@@ -69,7 +70,7 @@ def _start_top_level_action(
     return ACTION_HOOK_MANAGER.create_checkpoint(action_name, ctx)
 
 
-def _finish_top_level_action(
+async def _finish_top_level_action(
     checkpoint: ActionCheckpoint | None,
     ctx: RunContext[TaskState],
     action_args: dict[str, object],
@@ -84,6 +85,12 @@ def _finish_top_level_action(
         error=error,
         current_task_state=ctx.deps,
     )
+    if checkpoint is not None:
+        await ACTION_HOOK_MANAGER.wait_for_checkpoint(
+            checkpoint.id,
+            action_hook_wait_seconds(),
+        )
+        ACTION_HOOK_MANAGER.raise_if_intervention(current_messages=ctx.messages)
 
 
 async def _await_with_action_hook_cancellation(
@@ -119,7 +126,7 @@ async def _await_top_level_action_step(
     except ActionIntervention:
         raise
     except Exception as exc:
-        _finish_top_level_action(checkpoint, ctx, action_args, error=exc)
+        await _finish_top_level_action(checkpoint, ctx, action_args, error=exc)
         raise
 
 
@@ -354,7 +361,7 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
 
     USAGE_TRACKER.add("PROBE", probing_usage)
 
-    _finish_top_level_action(checkpoint, ctx, {}, result=env)
+    await _finish_top_level_action(checkpoint, ctx, {}, result=env)
     return env
 
 
@@ -394,7 +401,7 @@ async def execute_tests(ctx: RunContext[TaskState], instruction: str) -> TestRes
     except ActionIntervention:
         raise
     except Exception as exc:
-        _finish_top_level_action(
+        await _finish_top_level_action(
             checkpoint,
             ctx,
             {"instruction": instruction},
@@ -405,9 +412,12 @@ async def execute_tests(ctx: RunContext[TaskState], instruction: str) -> TestRes
 
     logger.info(f"[Test Execution Agent] Tests resulted in {test_result}")
 
-    USAGE_TRACKER.add(test_agent.name, test_agent_output.usage())
+    USAGE_TRACKER.add(
+        usage_tracker_name(test_agent.name, "execute_tests"),
+        test_agent_output.usage(),
+    )
 
-    _finish_top_level_action(
+    await _finish_top_level_action(
         checkpoint,
         ctx,
         {"instruction": instruction},
@@ -442,7 +452,7 @@ async def search_code(ctx: RunContext[TaskState], instruction: str) -> list[Loca
     except ActionIntervention:
         raise
     except Exception as exc:
-        _finish_top_level_action(
+        await _finish_top_level_action(
             checkpoint,
             ctx,
             {"instruction": instruction},
@@ -458,8 +468,11 @@ async def search_code(ctx: RunContext[TaskState], instruction: str) -> list[Loca
     # update task state with the found code locations
     ctx.deps.code_locations.extend(locations)
 
-    USAGE_TRACKER.add(search_code_agent.name, search_code_agent_result.usage())
-    _finish_top_level_action(
+    USAGE_TRACKER.add(
+        usage_tracker_name(search_code_agent.name, "search_code"),
+        search_code_agent_result.usage(),
+    )
+    await _finish_top_level_action(
         checkpoint,
         ctx,
         {"instruction": instruction},
@@ -505,8 +518,11 @@ async def edit_code(
         diff_key: DiffEntryKey = edit_result.output
         logger.info(f"[MetaAgent] edit_code result: {diff_key}")
         # DevNote: Since #44 adding diffs to diffstore is done at `extract_diff`
-        USAGE_TRACKER.add(edit_code_agent.name, edit_result.usage())
-        _finish_top_level_action(
+        USAGE_TRACKER.add(
+            usage_tracker_name(edit_code_agent.name, "edit_code"),
+            edit_result.usage(),
+        )
+        await _finish_top_level_action(
             checkpoint,
             ctx,
             {"instruction": instruction},
@@ -521,7 +537,7 @@ async def edit_code(
         result = ToolErrorInfo(
             message="There have been issue following your instructions for `edit_code`. Either they have been too complex or too vague, or they caused an issue within the pydantic_ai framework. Reconsider your instructions and consider doing `step-by-step` changes. If the task is in a corrupted / poor state (e.g. a file was deleted that should not be), try to restore a good state of the project before editing again."
         )
-        _finish_top_level_action(
+        await _finish_top_level_action(
             checkpoint,
             ctx,
             {"instruction": instruction},
@@ -539,7 +555,7 @@ async def edit_code(
         result = ToolErrorInfo(
             message=f"There have been issue executing your instructions for `edit_code`. Either they have been too complex, or they caused an issue within the pydantic_ai framework. Reconsider your instructions regarding to the error {ai_model_behavior_exc} and try to avoid it. If the task is in a corrupted / poor state (e.g. a file was deleted that should not be), try to restore a good state of the project before editing again."
         )
-        _finish_top_level_action(
+        await _finish_top_level_action(
             checkpoint,
             ctx,
             {"instruction": instruction},
@@ -551,7 +567,7 @@ async def edit_code(
     except Exception as e:
         # TODO: Do we have to look for more issues here? Do we want to?
         # There are at least ModelHTTP Errors but I think those are valid to end the run.
-        _finish_top_level_action(
+        await _finish_top_level_action(
             checkpoint,
             ctx,
             {"instruction": instruction},
@@ -589,7 +605,7 @@ async def vcs(
     except ActionIntervention:
         raise
     except Exception as exc:
-        _finish_top_level_action(
+        await _finish_top_level_action(
             checkpoint,
             ctx,
             {"instruction": instruction},
@@ -606,8 +622,8 @@ async def vcs(
         )
     elif vcs_result.output is None:
         logger.info("[MetaAgent] VCS-agent returned `None`")
-    USAGE_TRACKER.add(vcs_agent.name, vcs_result.usage())
-    _finish_top_level_action(
+    USAGE_TRACKER.add(usage_tracker_name(vcs_agent.name, "vcs"), vcs_result.usage())
+    await _finish_top_level_action(
         checkpoint,
         ctx,
         {"instruction": instruction},
@@ -643,7 +659,10 @@ def advising_on_doubts(
         usage_limits=UsageLimits(request_limit=constants.ADVISOR_AGENT_REQUEST_LIMIT),
     )
     logger.debug(f"[Meta] Advice received from Advisor Agent: {advise_result.output}")
-    USAGE_TRACKER.add(advisor_agent.name, advise_result.usage())
+    USAGE_TRACKER.add(
+        usage_tracker_name(advisor_agent.name, "advisor"),
+        advise_result.usage(),
+    )
     return advise_result.output
 
 
@@ -672,5 +691,8 @@ def _gather_checklist(
         message_history=message_history,
     )
     logger.debug(f"[Meta] CheckList result: {checklist_result.output}")
-    USAGE_TRACKER.add(checklist_agent.name, checklist_result.usage())
+    USAGE_TRACKER.add(
+        usage_tracker_name(checklist_agent.name, "checklist"),
+        checklist_result.usage(),
+    )
     return checklist_result.output

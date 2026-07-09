@@ -327,6 +327,36 @@ class ActionHookManager:
                 )
             raise ActionIntervention(request)
 
+    async def wait_for_checkpoint(self, checkpoint_id: str, timeout_seconds: float) -> None:
+        if timeout_seconds <= 0:
+            return
+        tasks = [
+            task
+            for task, pending_checkpoint_id in self._pending_checkpoints.items()
+            if pending_checkpoint_id == checkpoint_id
+        ]
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
+        if pending:
+            self.record_diagnostic(
+                "hook_wait_timeout",
+                checkpoint_id=checkpoint_id,
+                completed_hooks=len(done),
+                pending_hooks=len(pending),
+                timeout_seconds=timeout_seconds,
+            )
+            for task in pending:
+                token = self._pending.pop(task, None)
+                if token is not None:
+                    token.cancel()
+                self._pending_checkpoints.pop(task, None)
+                if not task.done():
+                    task.cancel()
+            self._checkpoint_pending_counts.pop(checkpoint_id, None)
+            if self._intervention is None:
+                self.cleanup_filesystem_snapshot(checkpoint_id)
+
     def cancel_pending(
         self,
         *,
@@ -803,11 +833,26 @@ def configure_action_hook_policy_from_environment(
     )
 
 
+def action_hook_wait_seconds() -> float:
+    return _env_float("USEAGENT_ACTION_HOOK_WAIT_SECONDS", default=0.0, minimum=0.0)
+
+
 def _env_flag(name: str, *, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
     return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_float(name: str, *, default: float, minimum: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    return max(minimum, parsed)
 
 
 ACTION_HOOK_MANAGER = ActionHookManager()

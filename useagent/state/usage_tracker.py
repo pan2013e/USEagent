@@ -1,10 +1,19 @@
 from collections import defaultdict
 
 from loguru import logger
-from pydantic import validate_call
+from pydantic import TypeAdapter, validate_call
 from pydantic_ai.usage import RunUsage
 
 from useagent.pydantic_models.common.constrained_types import NonEmptyStr
+
+_NON_EMPTY_STR = TypeAdapter(NonEmptyStr)
+
+
+def usage_tracker_name(name: object, fallback: str) -> NonEmptyStr:
+    candidate = str(name).strip() if name is not None else ""
+    if not candidate:
+        candidate = fallback
+    return _NON_EMPTY_STR.validate_python(candidate)
 
 
 class UsageTracker:

@@ -157,6 +157,79 @@ async def test_top_level_action_hook_does_not_block_search_code(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+async def test_top_level_action_hook_waits_when_configured(monkeypatch, tmp_path):
+    monkeypatch.setenv("USEAGENT_ACTION_HOOK_WAIT_SECONDS", "1")
+    ctx = make_context(tmp_path)
+    meta.USAGE_TRACKER = UsageTracker()
+
+    class FakeSearchAgent:
+        name = "SEARCH"
+
+        async def run(self, *args, **kwargs):
+            return SimpleNamespace(output=[], usage=lambda: RunUsage())
+
+    async def hook(event, token):
+        await asyncio.sleep(0)
+        return HookDecision.intervene(
+            "Reconsider before the model can choose another action.",
+            reason="blocking hook feedback",
+        )
+
+    monkeypatch.setattr(meta, "init_search_code_agent", lambda: FakeSearchAgent())
+    ACTION_HOOK_MANAGER.register(hook)
+
+    with pytest.raises(ActionIntervention) as exc_info:
+        await meta.search_code(ctx, "find relevant code")
+
+    assert exc_info.value.request.decision.reason == "blocking hook feedback"
+    assert any(
+        item["event"] == "intervention_queued"
+        for item in ACTION_HOOK_MANAGER.diagnostics()
+    )
+
+
+@pytest.mark.asyncio
+async def test_top_level_action_hook_wait_timeout_keeps_action_result(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("USEAGENT_ACTION_HOOK_WAIT_SECONDS", "0.01")
+    ctx = make_context(tmp_path)
+    meta.USAGE_TRACKER = UsageTracker()
+    release = asyncio.Event()
+
+    class FakeSearchAgent:
+        name = "SEARCH"
+
+        async def run(self, *args, **kwargs):
+            return SimpleNamespace(output=[], usage=lambda: RunUsage())
+
+    async def hook(event, token):
+        await release.wait()
+        return HookDecision.intervene("This arrives too late for the wait window.")
+
+    monkeypatch.setattr(meta, "init_search_code_agent", lambda: FakeSearchAgent())
+    ACTION_HOOK_MANAGER.register(hook)
+    diagnostic_start = len(ACTION_HOOK_MANAGER.diagnostics())
+
+    result = await meta.search_code(ctx, "find relevant code")
+
+    new_diagnostics = ACTION_HOOK_MANAGER.diagnostics()[diagnostic_start:]
+    assert result == []
+    assert any(
+        item["event"] == "hook_wait_timeout"
+        for item in new_diagnostics
+    )
+    release.set()
+    await asyncio.sleep(0)
+    ACTION_HOOK_MANAGER.raise_if_intervention()
+    assert not any(
+        item["event"] == "intervention_queued"
+        for item in ACTION_HOOK_MANAGER.diagnostics()[diagnostic_start:]
+    )
+
+
+@pytest.mark.asyncio
 async def test_hook_intervention_is_queued_after_action(monkeypatch, tmp_path):
     ctx = make_context(tmp_path)
     meta.USAGE_TRACKER = UsageTracker()
