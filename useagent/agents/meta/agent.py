@@ -1,21 +1,38 @@
+import asyncio
+from copy import deepcopy
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from loguru import logger
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import (
+    Agent,
+    CallToolsNode,
+    DeferredToolRequests,
+    DeferredToolResults,
+    ModelRequestNode,
+    RunContext,
+    RunUsage,
+    ToolApproved,
+    ToolDenied,
+)
 from pydantic_ai.messages import (
     BaseToolCallPart,
     BaseToolReturnPart,
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
+    ToolCallPart,
 )
+from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import Tool
 from pydantic_ai.usage import UsageLimits
+from pydantic_graph import End
 
 import useagent.common.constants as constants
 from useagent.action_hooks import (
     ACTION_HOOK_MANAGER,
+    ActionHookSchedulerError,
     ActionIntervention,
     ActionInterventionRequest,
     restore_filesystem_snapshot,
@@ -49,6 +66,7 @@ from useagent.tools.bash import (
 )
 from useagent.tools.edit import init_edit_tools
 from useagent.tools.meta import (  # Agent-State Tools; Agent-Agent Tools
+    ORDERED_ACTION_ERROR_PREFIX,
     _gather_checklist,
     _set_usage_tracker,
     advising_on_doubts,
@@ -64,6 +82,21 @@ SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text()
 
 _NO_DOUBT_PREFIXES = {"none", "no", "n/a", "no doubt", "no doubts"}
 
+_STATEFUL_META_TOOL_NAMES = frozenset(
+    {
+        "bash_tool",
+        "edit_code",
+        "search_code",
+        "probe_environment",
+        "execute_tests",
+        "vcs",
+    }
+)
+
+
+class OrderedToolDispatchError(RuntimeError):
+    """The pinned agent runtime violated the ordered-dispatch contract."""
+
 
 def _has_real_doubts(doubts: str | None) -> bool:
     if not doubts:
@@ -72,7 +105,7 @@ def _has_real_doubts(doubts: str | None) -> bool:
     return cleaned not in _NO_DOUBT_PREFIXES
 
 
-def _apply_action_hook_intervention(
+async def _apply_action_hook_intervention(
     request: ActionInterventionRequest,
     task_state: TaskState,
     intervention_count: int,
@@ -92,6 +125,7 @@ def _apply_action_hook_intervention(
         ACTION_HOOK_MANAGER.ignore_future_interventions(reason)
         return intervention_count, None
 
+    await ACTION_HOOK_MANAGER.prepare_intervention(request)
     logger.info(
         "[ActionHook] Applying intervention from checkpoint "
         f"{request.checkpoint.id} after {request.checkpoint.action_name}"
@@ -107,7 +141,10 @@ def _apply_action_hook_intervention(
                 bash_history_length=request.restore_bash_history_length,
             )
         if request.restore_filesystem_snapshot is not None:
-            restore_filesystem_snapshot(request.restore_filesystem_snapshot)
+            await _run_blocking_restore_owned(
+                restore_filesystem_snapshot,
+                request.restore_filesystem_snapshot,
+            )
     ACTION_HOOK_MANAGER.cleanup_filesystem_snapshot(request.checkpoint.id)
     task_state.additional_knowledge.update(request.decision.additional_knowledge)
     ACTION_HOOK_MANAGER.record_diagnostic(
@@ -119,6 +156,20 @@ def _apply_action_hook_intervention(
         and request.decision.restore_to_checkpoint,
     )
     return intervention_count, _format_action_hook_intervention_instruction(request)
+
+
+async def _run_blocking_restore_owned(function: Any, /, *args: Any) -> Any:
+    """Do not orphan a destructive restore if the agent task is cancelled."""
+
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        except BaseException:
+            pass
+        raise
 
 
 def _message_history_for_action_hook_intervention(
@@ -135,14 +186,27 @@ def _message_history_for_action_hook_intervention(
             request.replay_messages,
             request.checkpoint.action_name,
             start_index=len(request.checkpoint.messages),
+            tool_call_id=request.checkpoint.tool_call_id,
         )
     if completed_messages is not None:
         return _message_history_through_action(
             completed_messages,
             request.checkpoint.action_name,
             start_index=len(request.checkpoint.messages),
+            tool_call_id=request.checkpoint.tool_call_id,
         )
     return _drop_trailing_tool_call_messages(request.checkpoint.messages)
+
+
+def _message_history_for_suppressed_action_hook_intervention(
+    request: ActionInterventionRequest,
+) -> list[ModelMessage]:
+    """Resume the current trajectory when an intervention is policy-suppressed."""
+
+    messages = request.replay_messages
+    if messages is None:
+        messages = request.checkpoint.messages
+    return _drop_trailing_tool_call_messages(messages)
 
 
 def _message_history_through_action(
@@ -150,21 +214,24 @@ def _message_history_through_action(
     action_name: str,
     *,
     start_index: int = 0,
+    tool_call_id: str | None = None,
 ) -> list[ModelMessage]:
-    action_call_ids: set[str] = set()
+    action_call_ids: set[str] = {tool_call_id} if tool_call_id else set()
     action_return_index: int | None = None
+    scan_start = 0 if tool_call_id else start_index
 
-    for index, message in enumerate(messages[start_index:], start=start_index):
+    for index, message in enumerate(messages[scan_start:], start=scan_start):
         if isinstance(message, ModelResponse):
             for part in message.parts or []:
-                if (
-                    isinstance(part, BaseToolCallPart)
-                    and part.tool_name == action_name
+                if isinstance(part, BaseToolCallPart) and (
+                    part.tool_call_id == tool_call_id
+                    if tool_call_id
+                    else part.tool_name == action_name
                 ):
                     action_call_ids.add(part.tool_call_id)
         elif isinstance(message, ModelRequest) and action_call_ids:
             if any(
-                isinstance(part, BaseToolReturnPart)
+                isinstance(part, (BaseToolReturnPart, RetryPromptPart))
                 and part.tool_call_id in action_call_ids
                 for part in message.parts or []
             ):
@@ -205,10 +272,12 @@ def init_agent(
             "AppConfig must not be None when initializing the meta agent."
         )
 
+    agent_output_type = [output_type, DeferredToolRequests]
     meta_agent = Agent(
         config.model,
         instructions=SYSTEM_PROMPT,
         deps_type=TaskState,
+        model_settings={"parallel_tool_calls": False},
         retries=constants.META_AGENT_RETRIES,
         output_retries=constants.META_AGENT_OUTPUT_RETRIES,
         tools=[
@@ -220,25 +289,41 @@ def init_agent(
                     bash_call_delay_in_seconds=constants.META_AGENT_BASH_TOOL_DELAY,
                 ),
                 max_retries=4,
+                requires_approval=True,
             ),
             # Agent-Agent Tools
-            Tool(edit_code, takes_ctx=True, max_retries=constants.EDIT_CODE_RETRIES),
             Tool(
-                search_code, takes_ctx=True, max_retries=constants.SEARCH_AGENT_RETRIES
+                edit_code,
+                takes_ctx=True,
+                max_retries=constants.EDIT_CODE_RETRIES,
+                requires_approval=True,
+            ),
+            Tool(
+                search_code,
+                takes_ctx=True,
+                max_retries=constants.SEARCH_AGENT_RETRIES,
+                requires_approval=True,
             ),
             Tool(
                 probe_environment,
                 takes_ctx=True,
                 max_retries=constants.PROBE_ENVIRONMENT_RETRIES,
+                requires_approval=True,
             ),
             Tool(
                 execute_tests,
                 takes_ctx=True,
                 max_retries=constants.EXECUTE_TESTS_RETRIES,
+                requires_approval=True,
             ),
-            Tool(vcs, takes_ctx=True, max_retries=constants.VCS_AGENT_RETRIES),
+            Tool(
+                vcs,
+                takes_ctx=True,
+                max_retries=constants.VCS_AGENT_RETRIES,
+                requires_approval=True,
+            ),
         ],
-        output_type=output_type,
+        output_type=agent_output_type,
         history_processors=[fit_messages_into_context_window],
     )
 
@@ -278,7 +363,181 @@ def init_agent(
     return meta_agent
 
 
-def agent_loop(
+def _ordered_approval_calls(
+    requests: DeferredToolRequests,
+    messages: list[ModelMessage],
+) -> list[ToolCallPart]:
+    if requests.calls:
+        raise OrderedToolDispatchError(
+            "Ordered Meta dispatch does not support externally executed tools"
+        )
+    if not requests.approvals:
+        raise OrderedToolDispatchError(
+            "Pydantic AI returned empty DeferredToolRequests"
+        )
+
+    approval_ids = [call.tool_call_id for call in requests.approvals]
+    if len(approval_ids) != len(set(approval_ids)):
+        raise OrderedToolDispatchError("Deferred tool-call identifiers are not unique")
+
+    response: ModelResponse | None = None
+    part_indexes: dict[str, int] = {}
+    for message in reversed(messages):
+        if not isinstance(message, ModelResponse):
+            continue
+        candidate_indexes = {
+            part.tool_call_id: index
+            for index, part in enumerate(message.parts)
+            if isinstance(part, ToolCallPart)
+        }
+        if set(approval_ids).issubset(candidate_indexes):
+            response = message
+            part_indexes = candidate_indexes
+            break
+
+    if response is None:
+        raise OrderedToolDispatchError(
+            "Deferred tool calls do not belong to a retained ModelResponse"
+        )
+
+    calls = sorted(requests.approvals, key=lambda call: part_indexes[call.tool_call_id])
+    unknown = [
+        call.tool_name
+        for call in calls
+        if call.tool_name not in _STATEFUL_META_TOOL_NAMES
+    ]
+    if unknown:
+        raise OrderedToolDispatchError(
+            "Unexpected approval-required Meta tools: " + ", ".join(unknown)
+        )
+    return calls
+
+
+async def _run_approved_tool_to_safe_point(
+    meta_agent: Agent[TaskState, Any],
+    task_state: TaskState,
+    messages: list[ModelMessage],
+    deferred_results: DeferredToolResults,
+    usage: RunUsage,
+) -> list[ModelMessage]:
+    async with meta_agent.iter(
+        None,
+        deps=task_state,
+        message_history=messages,
+        deferred_tool_results=deferred_results,
+        usage=usage,
+        usage_limits=UsageLimits(request_limit=constants.META_AGENT_REQUEST_LIMIT),
+    ) as agent_run:
+        node = agent_run.next_node
+        while not isinstance(node, End):
+            current = node
+            node = await agent_run.next(current)
+            if isinstance(current, CallToolsNode):
+                if not isinstance(node, ModelRequestNode):
+                    raise OrderedToolDispatchError(
+                        "Approved stateful tool did not produce a ModelRequestNode"
+                    )
+                return [
+                    *deepcopy(agent_run.ctx.state.message_history),
+                    deepcopy(node.request),
+                ]
+
+    raise OrderedToolDispatchError(
+        "Approved stateful tool reached the end of the agent graph without a safe point"
+    )
+
+
+async def _run_meta_agent_turn(
+    meta_agent: Agent[TaskState, Any],
+    prompt: str | None,
+    task_state: TaskState,
+    message_history: list[ModelMessage] | None,
+) -> AgentRunResult[Any]:
+    usage = RunUsage()
+    current_prompt: str | None = prompt
+    current_messages = message_history
+    while True:
+        result = await meta_agent.run(
+            current_prompt,
+            deps=task_state,
+            usage=usage,
+            usage_limits=UsageLimits(request_limit=constants.META_AGENT_REQUEST_LIMIT),
+            message_history=current_messages,
+        )
+        if not isinstance(result.output, DeferredToolRequests):
+            await ACTION_HOOK_MANAGER.final_drain()
+            ACTION_HOOK_MANAGER.raise_if_intervention(
+                current_messages=result.all_messages()
+            )
+            return result
+
+        deferred_messages = result.all_messages()
+        calls = _ordered_approval_calls(result.output, deferred_messages)
+        selected = calls[0]
+
+        await ACTION_HOOK_MANAGER.before_tool_approval(
+            selected.tool_name,
+            current_messages=deferred_messages,
+        )
+
+        deferred_results = DeferredToolResults(
+            approvals={
+                call.tool_call_id: (
+                    ToolApproved()
+                    if call.tool_call_id == selected.tool_call_id
+                    else ToolDenied(
+                        "Deferred by USEagent ordered dispatch. Resubmit this "
+                        "tool call after the current action boundary."
+                    )
+                )
+                for call in calls
+            }
+        )
+        try:
+            protocol_messages = await _run_approved_tool_to_safe_point(
+                meta_agent,
+                task_state,
+                deferred_messages,
+                deferred_results,
+                usage,
+            )
+        except BaseException:
+            await ACTION_HOOK_MANAGER.invalidate_action(
+                tool_call_id=selected.tool_call_id
+            )
+            raise
+        await ACTION_HOOK_MANAGER.protocol_finalized(
+            selected.tool_call_id,
+            protocol_messages,
+        )
+        selected_action_error = any(
+            isinstance(message, ModelRequest)
+            and any(
+                isinstance(part, RetryPromptPart)
+                and part.tool_call_id == selected.tool_call_id
+                and isinstance(part.content, str)
+                and part.content.startswith(ORDERED_ACTION_ERROR_PREFIX)
+                for part in message.parts
+            )
+            for message in protocol_messages
+        )
+        if selected_action_error:
+            # Ordered wrappers translate an uncaught action exception into a
+            # protocol-valid retry part while the scheduler retains the real
+            # exception. Error actions are speculation barriers, so finish
+            # their gate analysis before deciding whether feedback supersedes
+            # the original exception.
+            await ACTION_HOOK_MANAGER.final_drain()
+        ACTION_HOOK_MANAGER.raise_if_intervention(current_messages=protocol_messages)
+        action_error = ACTION_HOOK_MANAGER.pop_action_error(selected.tool_call_id)
+        if action_error is not None:
+            raise action_error
+
+        current_prompt = None
+        current_messages = protocol_messages
+
+
+async def agent_loop(
     task_state: TaskState,
     output_type: Literal[CodeChange, Answer, Action] = CodeChange,
     output_dir: Path | None = None,
@@ -297,7 +556,7 @@ def agent_loop(
     _set_usage_tracker(USAGE_TRACKER)
     meta_agent = init_agent(output_type=output_type)
 
-    ACTION_HOOK_MANAGER.reset_runtime()
+    await ACTION_HOOK_MANAGER.start_session()
 
     # actually running the agent
     prompt = "Invoke tools to complete the task."
@@ -305,13 +564,11 @@ def agent_loop(
     action_hook_interventions = 0
     while True:
         try:
-            result = meta_agent.run_sync(
+            result = await _run_meta_agent_turn(
+                meta_agent,
                 prompt,
-                deps=task_state,
-                usage_limits=UsageLimits(
-                    request_limit=constants.META_AGENT_REQUEST_LIMIT
-                ),
-                message_history=message_history,
+                task_state,
+                message_history,
             )
             USAGE_TRACKER.add(
                 usage_tracker_name(meta_agent.name, "meta"),
@@ -323,7 +580,7 @@ def agent_loop(
                 (
                     action_hook_interventions,
                     intervention_prompt,
-                ) = _apply_action_hook_intervention(
+                ) = await _apply_action_hook_intervention(
                     request,
                     task_state,
                     action_hook_interventions,
@@ -342,7 +599,7 @@ def agent_loop(
             (
                 action_hook_interventions,
                 intervention_prompt,
-            ) = _apply_action_hook_intervention(
+            ) = await _apply_action_hook_intervention(
                 request,
                 task_state,
                 action_hook_interventions,
@@ -350,6 +607,14 @@ def agent_loop(
             if intervention_prompt is not None:
                 prompt = intervention_prompt
                 message_history = _message_history_for_action_hook_intervention(request)
+            else:
+                # The cap suppresses the intervention itself, including its
+                # requested rollback. Resume from the live safe boundary that
+                # raised ActionIntervention, not the stale turn input.
+                prompt = None
+                message_history = (
+                    _message_history_for_suppressed_action_hook_intervention(request)
+                )
 
     last_iteration_messages = result.all_messages()
 
@@ -401,14 +666,14 @@ def agent_loop(
                         )
                     case _:
                         artifact = str(result.output)
-                new_instruction: str = advising_on_doubts(
+                new_instruction: str | None = await advising_on_doubts(
                     artifact=artifact,
                     doubts=result.output.doubts,
                     task_desc=task_state._task.get_issue_statement(),
                     cmd_history=bash_infos,
                 )
 
-                checklist = _gather_checklist(
+                checklist = await _gather_checklist(
                     task_instruction=new_instruction,
                     task_state=task_state,
                     cmd_history=bash_infos,
@@ -419,13 +684,11 @@ def agent_loop(
                 message_history = last_iteration_messages
                 while True:
                     try:
-                        result = meta_agent.run_sync(
+                        result = await _run_meta_agent_turn(
+                            meta_agent,
                             new_instruction,
-                            deps=task_state,
-                            usage_limits=UsageLimits(
-                                request_limit=constants.META_AGENT_REQUEST_LIMIT
-                            ),
-                            message_history=message_history,
+                            task_state,
+                            message_history,
                         )
                         USAGE_TRACKER.add(
                             usage_tracker_name(meta_agent.name, "meta"),
@@ -437,7 +700,7 @@ def agent_loop(
                             (
                                 action_hook_interventions,
                                 intervention_prompt,
-                            ) = _apply_action_hook_intervention(
+                            ) = await _apply_action_hook_intervention(
                                 request,
                                 task_state,
                                 action_hook_interventions,
@@ -445,9 +708,11 @@ def agent_loop(
                             if intervention_prompt is None:
                                 break
                             new_instruction = intervention_prompt
-                            message_history = _message_history_for_action_hook_intervention(
-                                request,
-                                completed_messages,
+                            message_history = (
+                                _message_history_for_action_hook_intervention(
+                                    request,
+                                    completed_messages,
+                                )
                             )
                             continue
                         break
@@ -456,18 +721,28 @@ def agent_loop(
                         (
                             action_hook_interventions,
                             intervention_prompt,
-                        ) = _apply_action_hook_intervention(
+                        ) = await _apply_action_hook_intervention(
                             request,
                             task_state,
                             action_hook_interventions,
                         )
                         if intervention_prompt is not None:
                             new_instruction = intervention_prompt
-                            message_history = _message_history_for_action_hook_intervention(
+                            message_history = (
+                                _message_history_for_action_hook_intervention(request)
+                            )
+                        else:
+                            new_instruction = None
+                            message_history = _message_history_for_suppressed_action_hook_intervention(
                                 request
                             )
                 last_iteration_messages = result.all_messages()
             except Exception as exc:
+                if isinstance(
+                    exc,
+                    (ActionHookSchedulerError, OrderedToolDispatchError),
+                ):
+                    raise
                 logger.error(
                     f"[MetaAgent] Error while re-iterating the result after doubts. Re-using previous, initial result (with doubts). Exception was: {exc}"
                 )
@@ -499,7 +774,6 @@ def agent_loop(
             )
             logger.error(e)
 
-    ACTION_HOOK_MANAGER.cancel_pending()
     return result.output, USAGE_TRACKER, result.all_messages()
 
 
@@ -525,7 +799,7 @@ def _format_action_hook_intervention_instruction(
     pending action was removed from message history before replay.
     """
     return f"""
-    A non-blocking hook that runs after top-level USEagent actions has completed
+    An action hook scheduled after top-level USEagent actions has completed
     analysis of the `{request.checkpoint.action_name}` action and requested an
     intervention.
 

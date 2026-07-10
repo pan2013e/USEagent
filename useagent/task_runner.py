@@ -2,6 +2,7 @@
 Main entry point for running one task.
 """
 
+import asyncio
 import json
 import traceback
 from datetime import datetime
@@ -28,7 +29,6 @@ def run(
     output_dir: str,
     output_type: Literal[CodeChange, Answer, Action] = CodeChange,
 ):
-
     start_time = datetime.now()
 
     task_output_dir = (
@@ -37,15 +37,15 @@ def run(
     task_output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        _run(task, task_output_dir, output_type=output_type)
+        asyncio.run(_run(task, task_output_dir, output_type=output_type))
     except Exception as e:
         tb = traceback.format_exc()
         logger.error(f"Error running task {task.uid}: {e} \n{tb}")
         if isinstance(task, SWEbenchTask):
             logger.warning(f"Writing non-patch swe entry to {task_output_dir}")
             task.postprocess_swebench_task(result=None, output_dir=task_output_dir)
+        raise
     finally:
-        ACTION_HOOK_MANAGER.cancel_pending(clean_snapshots=True)
         end_time = datetime.now()
         duration = end_time - start_time
         logger.info(
@@ -65,7 +65,7 @@ def run(
         ACTION_HOOK_MANAGER.clear_diagnostics()
 
 
-def _run(
+async def _run(
     task: Task,
     task_output_dir: Path,
     output_type: Literal[CodeChange, Answer, Action] = CodeChange,
@@ -89,9 +89,12 @@ def _run(
     # start main agent loop
     logger.info("Starting main agent loop")
     log_commit_sha()
-    result, usage_tracker, messages = agent_loop(
-        task_state, output_type=output_type, output_dir=task_output_dir
-    )
+    try:
+        result, usage_tracker, messages = await agent_loop(
+            task_state, output_type=output_type, output_dir=task_output_dir
+        )
+    finally:
+        await ACTION_HOOK_MANAGER.cancel_and_close(clean_snapshots=True)
     match result:
         case Action():
             cast_result: Action = cast(Action, result)

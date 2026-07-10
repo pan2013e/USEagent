@@ -1,13 +1,13 @@
 import asyncio
 import time
 from collections.abc import Awaitable
-from contextlib import suppress
 from pathlib import Path
 from typing import TypeVar
 
 from loguru import logger
 from pydantic_ai import RunContext
 from pydantic_ai.exceptions import (
+    ModelRetry,
     ToolRetryError,
     UnexpectedModelBehavior,
     UsageLimitExceeded,
@@ -21,7 +21,6 @@ from useagent.action_hooks import (
     ActionCheckpoint,
     ActionIntervention,
     TopLevelActionName,
-    action_hook_wait_seconds,
 )
 from useagent.agents.advisor.agent import init_agent as init_advisor_agent
 from useagent.agents.checklist.agent import (
@@ -54,6 +53,10 @@ from useagent.tools.bash import get_bash_history
 
 USAGE_TRACKER: UsageTracker
 _ActionResultT = TypeVar("_ActionResultT")
+ORDERED_ACTION_ERROR_PREFIX = (
+    "The top-level action failed and USEagent recorded the failure for "
+    "ordered hook analysis"
+)
 
 
 def _set_usage_tracker(tracker: UsageTracker) -> None:
@@ -63,11 +66,11 @@ def _set_usage_tracker(tracker: UsageTracker) -> None:
     USAGE_TRACKER = tracker
 
 
-def _start_top_level_action(
+async def _start_top_level_action(
     action_name: TopLevelActionName,
     ctx: RunContext[TaskState],
 ) -> ActionCheckpoint | None:
-    return ACTION_HOOK_MANAGER.create_checkpoint(action_name, ctx)
+    return await ACTION_HOOK_MANAGER.begin_action(action_name, ctx)
 
 
 async def _finish_top_level_action(
@@ -78,41 +81,25 @@ async def _finish_top_level_action(
     result: object = None,
     error: BaseException | None = None,
 ) -> None:
-    ACTION_HOOK_MANAGER.schedule(
-        checkpoint=checkpoint,
-        action_args=action_args,
-        result=result,
-        error=error,
-        current_task_state=ctx.deps,
-    )
-    if checkpoint is not None:
-        await ACTION_HOOK_MANAGER.wait_for_checkpoint(
-            checkpoint.id,
-            action_hook_wait_seconds(),
+    try:
+        await ACTION_HOOK_MANAGER.finish_action(
+            checkpoint=checkpoint,
+            action_args=action_args,
+            result=result,
+            error=error,
+            current_task_state=ctx.deps,
+            current_messages=ctx.messages,
         )
-        ACTION_HOOK_MANAGER.raise_if_intervention(current_messages=ctx.messages)
+    except (asyncio.CancelledError, ActionIntervention):
+        await ACTION_HOOK_MANAGER.invalidate_action(checkpoint)
+        raise
 
 
 async def _await_with_action_hook_cancellation(
-    ctx: RunContext[TaskState],
+    _ctx: RunContext[TaskState],
     awaitable: Awaitable[_ActionResultT],
 ) -> _ActionResultT:
-    task = asyncio.create_task(awaitable)
-    try:
-        while True:
-            done, _pending = await asyncio.wait(
-                {task},
-                timeout=constants.ACTION_HOOK_CANCELLATION_POLL_SECONDS,
-            )
-            if task in done:
-                return await task
-            ACTION_HOOK_MANAGER.raise_if_intervention(current_messages=ctx.messages)
-    except Exception:
-        if not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-        raise
+    return await awaitable
 
 
 async def _await_top_level_action_step(
@@ -123,11 +110,16 @@ async def _await_top_level_action_step(
 ) -> _ActionResultT:
     try:
         return await _await_with_action_hook_cancellation(ctx, awaitable)
-    except ActionIntervention:
+    except (asyncio.CancelledError, ActionIntervention):
+        await ACTION_HOOK_MANAGER.invalidate_action(checkpoint)
         raise
     except Exception as exc:
         await _finish_top_level_action(checkpoint, ctx, action_args, error=exc)
-        raise
+        raise ModelRetry(_ordered_action_error_message(exc)) from exc
+
+
+def _ordered_action_error_message(exc: BaseException) -> str:
+    return f"{ORDERED_ACTION_ERROR_PREFIX} ({type(exc).__name__}: {exc})."
 
 
 # ===================================================================
@@ -255,7 +247,7 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
     As a side effect, the current environment in the TaskState will be set to the newly obtained one.
     """
     logger.info("[MetaAgent] Invoked probe_environment")
-    checkpoint = _start_top_level_action("probe_environment", ctx)
+    checkpoint = await _start_top_level_action("probe_environment", ctx)
 
     logger.trace("[Probing Agent] Looking for Project root (Path)")
     path_probing_agent = init_probing_agent(output_type=Path, deps_type=None)
@@ -384,7 +376,7 @@ async def execute_tests(ctx: RunContext[TaskState], instruction: str) -> TestRes
     """
     logger.info("[MetaAgent] Invoked execute_tests")
     logger.debug(f"[MetaAgent] Instructions to Execute Tests: {instruction}")
-    checkpoint = _start_top_level_action("execute_tests", ctx)
+    checkpoint = await _start_top_level_action("execute_tests", ctx)
 
     test_agent = init_test_execution_agent()
     try:
@@ -398,7 +390,8 @@ async def execute_tests(ctx: RunContext[TaskState], instruction: str) -> TestRes
                 ),
             ),
         )
-    except ActionIntervention:
+    except (asyncio.CancelledError, ActionIntervention):
+        await ACTION_HOOK_MANAGER.invalidate_action(checkpoint)
         raise
     except Exception as exc:
         await _finish_top_level_action(
@@ -407,7 +400,7 @@ async def execute_tests(ctx: RunContext[TaskState], instruction: str) -> TestRes
             {"instruction": instruction},
             error=exc,
         )
-        raise
+        raise ModelRetry(_ordered_action_error_message(exc)) from exc
     test_result: TestResult = test_agent_output.output
 
     logger.info(f"[Test Execution Agent] Tests resulted in {test_result}")
@@ -436,7 +429,7 @@ async def search_code(ctx: RunContext[TaskState], instruction: str) -> list[Loca
         list[Location]: List of locations in the codebase that match the search criteria.
     """
     logger.info(f"[MetaAgent] Invoked search_code with instruction: {instruction}")
-    checkpoint = _start_top_level_action("search_code", ctx)
+    checkpoint = await _start_top_level_action("search_code", ctx)
     search_code_agent = init_search_code_agent()
     try:
         search_code_agent_result = await _await_with_action_hook_cancellation(
@@ -449,7 +442,8 @@ async def search_code(ctx: RunContext[TaskState], instruction: str) -> list[Loca
                 ),
             ),
         )
-    except ActionIntervention:
+    except (asyncio.CancelledError, ActionIntervention):
+        await ACTION_HOOK_MANAGER.invalidate_action(checkpoint)
         raise
     except Exception as exc:
         await _finish_top_level_action(
@@ -458,7 +452,7 @@ async def search_code(ctx: RunContext[TaskState], instruction: str) -> list[Loca
             {"instruction": instruction},
             error=exc,
         )
-        raise
+        raise ModelRetry(_ordered_action_error_message(exc)) from exc
     locations = search_code_agent_result.output
     logger.info(
         f"[MetaAgent] search_code result found: {len(locations)} locations (see TRACE for detail)"
@@ -501,7 +495,7 @@ async def edit_code(
         DiffEntryKey: A pointer into your TaskState's diff_store that contains a unified diff of the changes that can be applied to the codebase.
     """
     logger.info(f"[MetaAgent] Invoked edit_code with instruction: {instruction}")
-    checkpoint = _start_top_level_action("edit_code", ctx)
+    checkpoint = await _start_top_level_action("edit_code", ctx)
     try:
         edit_code_agent = init_edit_code_agent()
 
@@ -522,13 +516,6 @@ async def edit_code(
             usage_tracker_name(edit_code_agent.name, "edit_code"),
             edit_result.usage(),
         )
-        await _finish_top_level_action(
-            checkpoint,
-            ctx,
-            {"instruction": instruction},
-            result=diff_key,
-        )
-        return diff_key
 
     except UsageLimitExceeded as usage_exc:
         logger.error(
@@ -562,7 +549,8 @@ async def edit_code(
             result=result,
         )
         return result
-    except ActionIntervention:
+    except (asyncio.CancelledError, ActionIntervention):
+        await ACTION_HOOK_MANAGER.invalidate_action(checkpoint)
         raise
     except Exception as e:
         # TODO: Do we have to look for more issues here? Do we want to?
@@ -573,7 +561,15 @@ async def edit_code(
             {"instruction": instruction},
             error=e,
         )
-        raise e
+        raise ModelRetry(_ordered_action_error_message(e)) from e
+
+    await _finish_top_level_action(
+        checkpoint,
+        ctx,
+        {"instruction": instruction},
+        result=diff_key,
+    )
+    return diff_key
 
 
 async def vcs(
@@ -588,7 +584,7 @@ async def vcs(
         DiffEntryKey | str | None: A pointer to a git-diff in the diffstore of the relevant entry, a string answering a question or retrieving other information, or None in case the performed action did not need any return value.
     """
     logger.info(f"[MetaAgent] Invoked vcs_agent with instruction: {instruction}")
-    checkpoint = _start_top_level_action("vcs", ctx)
+    checkpoint = await _start_top_level_action("vcs", ctx)
     vcs_agent = init_vcs_agent()
 
     try:
@@ -602,7 +598,8 @@ async def vcs(
                 ),
             ),
         )
-    except ActionIntervention:
+    except (asyncio.CancelledError, ActionIntervention):
+        await ACTION_HOOK_MANAGER.invalidate_action(checkpoint)
         raise
     except Exception as exc:
         await _finish_top_level_action(
@@ -611,7 +608,7 @@ async def vcs(
             {"instruction": instruction},
             error=exc,
         )
-        raise
+        raise ModelRetry(_ordered_action_error_message(exc)) from exc
 
     if isinstance(vcs_result.output, str) and vcs_result.output.startswith("diff_"):
         diff_key: DiffEntryKey = vcs_result.output
@@ -638,7 +635,7 @@ async def vcs(
 # ==========================================================================
 
 
-def advising_on_doubts(
+async def advising_on_doubts(
     artifact: str,
     doubts: str,
     task_desc: str,
@@ -653,7 +650,7 @@ def advising_on_doubts(
     )
 
     advisor_agent = init_advisor_agent()
-    advise_result = advisor_agent.run_sync(
+    advise_result = await advisor_agent.run(
         instructions,
         message_history=message_history,
         usage_limits=UsageLimits(request_limit=constants.ADVISOR_AGENT_REQUEST_LIMIT),
@@ -666,7 +663,7 @@ def advising_on_doubts(
     return advise_result.output
 
 
-def _gather_checklist(
+async def _gather_checklist(
     task_instruction: str,
     task_state: TaskState,
     cmd_history: list[str],
@@ -684,7 +681,7 @@ def _gather_checklist(
     checklist_agent = init_checklist_agent()
     empty_checklist: CheckList = CheckList()
 
-    checklist_result = checklist_agent.run_sync(
+    checklist_result = await checklist_agent.run(
         instructions,
         deps=empty_checklist,
         usage_limits=UsageLimits(request_limit=constants.CHECKLIST_AGENT_REQUEST_LIMIT),
