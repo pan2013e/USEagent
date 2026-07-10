@@ -128,6 +128,16 @@ with unrelated Docker jobs, so cgroup measurements and provider stage timings
 are more useful than whole-system load averages. Comparative runs at limits
 `1` and `4` remain necessary before retuning the defaults.
 
+The scenario is now encoded as the opt-in
+`test_profile_sympy_large_worktree_ordered_orchestration` system test in the
+parent repository. It pins the matching upstream SymPy tree, reconstructs the
+fixture and task, requires an explicit prebuilt image/model, records cgroup and
+disk samples, and asserts findings, rollback, a later clean scan, finalization,
+and cleanup. Snapshot events also report total materialization time plus
+restore creation, source-size walk, analysis-copy, and copied-tree-size phases.
+The adjacent deterministic profile uses ten curated validation-passing AST
+queries. The resource-variable full 130-query corpus remains excluded.
+
 ## Still Needed
 
 - [ ] Observer hook execution, queue coalescing, and overflow policies. Related

@@ -1444,6 +1444,14 @@ memory was 7,115,177,984 bytes. That provider run used sparse changed-file mode,
 so it measures large-worktree orchestration cost rather than full-SymPy query
 analysis.
 
+The parent repository now preserves this setup in
+`agent_integration/tests/test_useagent_feedback_profile.py`. The opt-in test
+pins the equivalent upstream SymPy tree, recreates the two-query task, and
+records scheduler-native snapshot phase durations, retained bytes, container
+cgroup use, and sampled temporary disk. A second deterministic profile runs ten
+curated validation-passing AST-only queries after a separate warm-up. It does
+not promote the heterogeneous full 130-query corpus into a default benchmark.
+
 To tune the ordered defaults, benchmark at least:
 
 - concurrency 1, 2, and 4;
