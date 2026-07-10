@@ -799,6 +799,7 @@ class ActionHookSession:
     ) -> tuple[FilesystemSnapshot | None, WorkspaceRevision]:
         if analysis_copy_count <= 0:
             raise ValueError("analysis_copy_count must be positive")
+        materialize_started = time.monotonic()
         try:
             root = Path(task_state._task.get_working_directory()).resolve()
         except BaseException as exc:
@@ -814,6 +815,11 @@ class ActionHookSession:
         analysis_roots: tuple[Path, ...] = ()
         restore_snapshot: FilesystemSnapshot | None = None
         restore_snapshot_size = 0
+        restore_snapshot_create_seconds = 0.0
+        restore_snapshot_size_seconds = 0.0
+        source_size_seconds = 0.0
+        analysis_copy_seconds = 0.0
+        analysis_size_seconds = 0.0
         try:
             for _ in range(analysis_copy_count):
                 parents.append(
@@ -821,20 +827,26 @@ class ActionHookSession:
                 )
             analysis_roots = tuple(parent / "tree" for parent in parents)
             if require_restore:
+                phase_started = time.monotonic()
                 restore_snapshot = await _run_blocking_owned(
                     create_filesystem_snapshot,
                     task_state,
                 )
+                restore_snapshot_create_seconds = time.monotonic() - phase_started
                 if restore_snapshot is None:
                     raise ActionHookSchedulerError(
                         "Could not create the required ordered restore point"
                     )
+                phase_started = time.monotonic()
                 restore_snapshot_size = await _run_blocking_owned(
                     _tree_size,
                     restore_snapshot.snapshot_root,
                 )
+                restore_snapshot_size_seconds = time.monotonic() - phase_started
             budget_bytes = int(self._config.snapshot_budget_mib * 1024 * 1024)
+            phase_started = time.monotonic()
             source_size = await _run_blocking_owned(_tree_size, root)
+            source_size_seconds = time.monotonic() - phase_started
             projected_size = (
                 self._snapshot_bytes
                 + restore_snapshot_size
@@ -845,6 +857,7 @@ class ActionHookSession:
                     "Ordered hook snapshot budget exceeded before copy "
                     f"({projected_size}>{budget_bytes} bytes)"
                 )
+            phase_started = time.monotonic()
             await _run_blocking_owned(
                 shutil.copytree,
                 root,
@@ -858,10 +871,13 @@ class ActionHookSession:
                     analysis_root,
                     symlinks=True,
                 )
+            analysis_copy_seconds = time.monotonic() - phase_started
+            phase_started = time.monotonic()
             sizes = [
                 await _run_blocking_owned(_tree_size, analysis_root)
                 for analysis_root in analysis_roots
             ]
+            analysis_size_seconds = time.monotonic() - phase_started
             size_bytes = sum(sizes)
             projected_size = self._snapshot_bytes + restore_snapshot_size + size_bytes
             if projected_size > budget_bytes:
@@ -913,6 +929,21 @@ class ActionHookSession:
             retained_snapshot_bytes=self._snapshot_bytes,
             snapshot_budget_bytes=budget_bytes,
             has_restore_snapshot=restore_snapshot is not None,
+            snapshot_duration_seconds=round(
+                time.monotonic() - materialize_started,
+                6,
+            ),
+            restore_snapshot_create_seconds=round(
+                restore_snapshot_create_seconds,
+                6,
+            ),
+            restore_snapshot_size_seconds=round(
+                restore_snapshot_size_seconds,
+                6,
+            ),
+            source_size_seconds=round(source_size_seconds, 6),
+            analysis_copy_seconds=round(analysis_copy_seconds, 6),
+            analysis_size_seconds=round(analysis_size_seconds, 6),
         )
         return restore_snapshot, revision
 

@@ -1138,6 +1138,23 @@ async def test_ordered_same_action_hooks_receive_isolated_workspaces(tmp_path):
             if event["event"] == "action_snapshot_created"
         )
         assert snapshot_event["analysis_workspace_count"] == 2
+        assert snapshot_event["snapshot_duration_seconds"] >= 0
+        assert snapshot_event["restore_snapshot_create_seconds"] >= 0
+        assert snapshot_event["restore_snapshot_size_seconds"] >= 0
+        assert snapshot_event["source_size_seconds"] >= 0
+        assert snapshot_event["analysis_copy_seconds"] >= 0
+        assert snapshot_event["analysis_size_seconds"] >= 0
+        measured_phases = sum(
+            snapshot_event[field]
+            for field in (
+                "restore_snapshot_create_seconds",
+                "restore_snapshot_size_seconds",
+                "source_size_seconds",
+                "analysis_copy_seconds",
+                "analysis_size_seconds",
+            )
+        )
+        assert snapshot_event["snapshot_duration_seconds"] + 0.00001 >= measured_phases
         assert not (tmp_path / "first-hook.txt").exists()
         assert not (tmp_path / "second-hook.txt").exists()
     finally:
