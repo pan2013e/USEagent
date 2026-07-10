@@ -5,19 +5,18 @@ import copy
 import hashlib
 import importlib
 import importlib.util
-import inspect
 import json
+import math
 import os
+import signal
 import shlex
 import shutil
 import subprocess
 import tempfile
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal, cast
-from uuid import uuid4
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, cast
 
 from loguru import logger
 from pydantic_ai import RunContext
@@ -26,7 +25,7 @@ from pydantic_core import to_jsonable_python
 
 import useagent.common.constants as constants
 from useagent.pydantic_models.task_state import TaskState
-from useagent.tools.bash import get_bash_history, truncate_bash_history
+from useagent.tools.bash import truncate_bash_history
 
 TopLevelActionName = Literal[
     "probe_environment",
@@ -35,6 +34,82 @@ TopLevelActionName = Literal[
     "edit_code",
     "vcs",
 ]
+_TOP_LEVEL_ACTION_NAMES = frozenset(
+    {"probe_environment", "search_code", "execute_tests", "edit_code", "vcs"}
+)
+
+HookMode = Literal["gate", "observer"]
+HookExecution = Literal["async", "process"]
+HookFailurePolicy = Literal["continue", "intervene", "abort"]
+
+if TYPE_CHECKING:
+    from useagent.action_hook_scheduler import ActionHookSession
+
+
+class ActionHookSchedulerError(RuntimeError):
+    """Ordered scheduling cannot safely continue."""
+
+
+class ActionHookResourceReleaseError(RuntimeError):
+    """A hook backend could not confirm release of its analysis workspace."""
+
+
+@dataclass(frozen=True)
+class OrderedHookSchedulerConfig:
+    max_concurrent_runs: int = 2
+    max_unretired_actions: int = 2
+    run_timeout_seconds: float = 300.0
+    post_action_patience_seconds: float = 0.0
+    intervention_quiesce_seconds: float = 30.0
+    cleanup_seconds: float = 30.0
+    finalize_seconds: float = 60.0
+    snapshot_budget_mib: float = 2048.0
+
+    def __post_init__(self) -> None:
+        for name in ("max_concurrent_runs", "max_unretired_actions"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        for name in (
+            "run_timeout_seconds",
+            "intervention_quiesce_seconds",
+            "cleanup_seconds",
+            "snapshot_budget_mib",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive finite number")
+        for name in ("post_action_patience_seconds", "finalize_seconds"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative finite number")
+
+    @classmethod
+    def from_settings(cls, settings: object) -> "OrderedHookSchedulerConfig":
+        return cls(
+            max_concurrent_runs=int(getattr(settings, "max_concurrent_runs")),
+            max_unretired_actions=int(getattr(settings, "max_unretired_actions")),
+            run_timeout_seconds=float(getattr(settings, "run_timeout_seconds")),
+            post_action_patience_seconds=float(
+                getattr(settings, "post_action_patience_seconds")
+            ),
+            intervention_quiesce_seconds=float(
+                getattr(settings, "intervention_quiesce_seconds")
+            ),
+            cleanup_seconds=float(getattr(settings, "cleanup_seconds")),
+            finalize_seconds=float(getattr(settings, "finalize_seconds")),
+            snapshot_budget_mib=float(getattr(settings, "snapshot_budget_mib")),
+        )
 
 
 @dataclass(frozen=True)
@@ -46,6 +121,10 @@ class ActionCheckpoint:
     bash_history_length: int
     generation: int
     created_at: datetime = field(default_factory=datetime.now)
+    session_id: str | None = None
+    epoch: int | None = None
+    action_seq: int | None = None
+    tool_call_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +168,12 @@ class ActionHookEvent:
     current_task_state: TaskState
     current_bash_history_length: int
     current_filesystem_snapshot: FilesystemSnapshot | None = None
+    session_id: str | None = None
+    epoch: int | None = None
+    action_seq: int | None = None
+    hook_job_id: str | None = None
+    workspace_revision_id: str | None = None
+    analysis_workspace: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +183,31 @@ class HookDecision:
     instruction: str | None = None
     additional_knowledge: dict[str, str] = field(default_factory=dict)
     restore_to_checkpoint: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, str) or self.kind not in {"noop", "intervene"}:
+            raise ValueError("HookDecision.kind must be noop or intervene")
+        if self.reason is not None and not isinstance(self.reason, str):
+            raise ValueError("HookDecision.reason must be a string or None")
+        if self.instruction is not None and not isinstance(self.instruction, str):
+            raise ValueError("HookDecision.instruction must be a string or None")
+        if self.kind == "intervene" and (
+            self.instruction is None or not self.instruction.strip()
+        ):
+            raise ValueError(
+                "HookDecision.instruction must be a non-empty string for intervention"
+            )
+        if self.kind == "noop" and self.instruction is not None:
+            raise ValueError("HookDecision.instruction must be None for a no-op")
+        if not isinstance(self.additional_knowledge, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in self.additional_knowledge.items()
+        ):
+            raise ValueError(
+                "HookDecision.additional_knowledge must be a dict of strings"
+            )
+        if not isinstance(self.restore_to_checkpoint, bool):
+            raise ValueError("HookDecision.restore_to_checkpoint must be a boolean")
 
     @classmethod
     def noop(cls, reason: str | None = None) -> "HookDecision":
@@ -116,7 +226,9 @@ class HookDecision:
             kind="intervene",
             reason=reason,
             instruction=instruction,
-            additional_knowledge=additional_knowledge or {},
+            additional_knowledge=(
+                {} if additional_knowledge is None else additional_knowledge
+            ),
             restore_to_checkpoint=restore_to_checkpoint,
         )
 
@@ -125,6 +237,80 @@ ActionHook = Callable[
     [ActionHookEvent, HookCancellationToken],
     HookDecision | None | Awaitable[HookDecision | None],
 ]
+
+
+@dataclass(frozen=True)
+class HookOptions:
+    """Scheduler metadata for one action-hook registration.
+
+    Metadata-free registrations use deterministic defaults. The runtime
+    currently supports gate hooks; observer hooks are reserved for a later
+    rollout and are rejected when a session starts.
+    """
+
+    id: str | None = None
+    actions: frozenset[TopLevelActionName] | None = None
+    mode: HookMode = "gate"
+    execution: HookExecution = "async"
+    priority: int = 0
+    timeout_seconds: float | None = None
+    failure_policy: HookFailurePolicy = "continue"
+    can_restore: bool = True
+    requires_speculation_barrier: bool = False
+
+    def __post_init__(self) -> None:
+        if self.id is not None and (
+            not isinstance(self.id, str) or not self.id.strip()
+        ):
+            raise ValueError("HookOptions.id must be a non-empty string")
+        if self.actions is not None:
+            if not isinstance(self.actions, frozenset):
+                raise ValueError("HookOptions.actions must be a frozenset")
+            if any(not isinstance(action, str) for action in self.actions):
+                raise ValueError("HookOptions.actions must contain strings")
+            unknown_actions = set(self.actions) - _TOP_LEVEL_ACTION_NAMES
+            if unknown_actions:
+                raise ValueError(
+                    "HookOptions.actions contains unknown top-level actions: "
+                    + ", ".join(sorted(unknown_actions))
+                )
+        if self.mode not in {"gate", "observer"}:
+            raise ValueError("HookOptions.mode must be gate or observer")
+        if self.execution not in {"async", "process"}:
+            raise ValueError("HookOptions.execution must be async or process")
+        if self.failure_policy not in {"continue", "intervene", "abort"}:
+            raise ValueError(
+                "HookOptions.failure_policy must be continue, intervene, or abort"
+            )
+        if isinstance(self.priority, bool) or not isinstance(self.priority, int):
+            raise ValueError("HookOptions.priority must be an integer")
+        if self.timeout_seconds is not None:
+            if (
+                isinstance(self.timeout_seconds, bool)
+                or not isinstance(self.timeout_seconds, (int, float))
+                or not math.isfinite(self.timeout_seconds)
+                or self.timeout_seconds <= 0
+            ):
+                raise ValueError(
+                    "HookOptions.timeout_seconds must be a positive finite number"
+                )
+        if not isinstance(self.can_restore, bool):
+            raise ValueError("HookOptions.can_restore must be a boolean")
+        if not isinstance(self.requires_speculation_barrier, bool):
+            raise ValueError(
+                "HookOptions.requires_speculation_barrier must be a boolean"
+            )
+
+    def matches(self, action_name: TopLevelActionName) -> bool:
+        return self.actions is None or action_name in self.actions
+
+
+@dataclass(frozen=True)
+class HookRegistration:
+    id: str
+    hook: ActionHook
+    options: HookOptions
+    order: int
 
 
 @dataclass(frozen=True)
@@ -163,24 +349,50 @@ class ActionIntervention(Exception):
 
 class ActionHookManager:
     def __init__(self) -> None:
-        self._hooks: list[ActionHook] = []
-        self._pending: dict[asyncio.Task[None], HookCancellationToken] = {}
-        self._pending_checkpoints: dict[asyncio.Task[None], str] = {}
-        self._checkpoint_pending_counts: dict[str, int] = {}
-        self._filesystem_snapshots: dict[str, FilesystemSnapshot] = {}
-        self._intervention: ActionInterventionRequest | None = None
-        self._interventions_ignored_reason: str | None = None
+        self._registrations: list[HookRegistration] = []
+        self._next_registration_order = 0
         self._policy = ActionHookPolicy()
         self._diagnostics: list[dict[str, Any]] = []
-        self._generation = 0
+        self._ordered_session: ActionHookSession | None = None
+        self._ordered_config: OrderedHookSchedulerConfig | None = None
 
     @property
     def has_hooks(self) -> bool:
-        return bool(self._hooks)
+        return bool(self._registrations)
 
-    def register(self, hook: ActionHook) -> Callable[[], None]:
-        self._hooks.append(hook)
-        self.record_diagnostic("hook_registered", hook=_hook_name(hook))
+    def register(
+        self,
+        hook: ActionHook,
+        *,
+        options: HookOptions | None = None,
+    ) -> Callable[[], None]:
+        if self._ordered_session is not None and not self._ordered_session.closed:
+            raise RuntimeError("Cannot register hooks after an ordered session starts")
+        options = options or HookOptions()
+        registration_order = self._next_registration_order
+        self._next_registration_order += 1
+        registration_id = options.id or f"{_hook_name(hook)}:{registration_order}"
+        if any(item.id == registration_id for item in self._registrations):
+            raise ValueError(
+                f"Duplicate action hook registration id: {registration_id}"
+            )
+        self._registrations.append(
+            HookRegistration(
+                id=registration_id,
+                hook=hook,
+                options=options,
+                order=registration_order,
+            )
+        )
+        self.record_diagnostic(
+            "hook_registered",
+            hook=_hook_name(hook),
+            hook_id=registration_id,
+            actions=sorted(options.actions or []),
+            mode=options.mode,
+            priority=options.priority,
+            failure_policy=options.failure_policy,
+        )
 
         def unregister() -> None:
             self.unregister(hook)
@@ -188,29 +400,24 @@ class ActionHookManager:
         return unregister
 
     def unregister(self, hook: ActionHook) -> None:
-        self._hooks = [registered for registered in self._hooks if registered != hook]
+        self._registrations = [
+            registration
+            for registration in self._registrations
+            if registration.hook != hook
+        ]
 
     def clear_hooks(self) -> None:
-        self.cancel_pending(clean_snapshots=True)
-        self._hooks.clear()
-        self._intervention = None
-        self._interventions_ignored_reason = None
-        self._generation += 1
+        if self._ordered_session is not None and not self._ordered_session.closed:
+            self._ordered_session.request_cancel()
+        self._registrations.clear()
 
     def reset_runtime(self, preserve_snapshot_id: str | None = None) -> None:
-        self.cancel_pending(
-            clean_snapshots=True,
-            preserve_snapshot_id=preserve_snapshot_id,
-        )
-        self._intervention = None
-        self._interventions_ignored_reason = None
-        self._generation += 1
+        if self._ordered_session is not None:
+            self._ordered_session.reset_runtime(preserve_snapshot_id)
 
     def ignore_future_interventions(self, reason: str) -> None:
-        self.cancel_pending(clean_snapshots=True)
-        self._intervention = None
-        self._interventions_ignored_reason = reason
-        self._generation += 1
+        if self._ordered_session is not None:
+            self._ordered_session.ignore_future_interventions(reason)
         self.record_diagnostic("interventions_ignored", reason=reason)
 
     def configure_policy(self, policy: ActionHookPolicy) -> None:
@@ -220,6 +427,130 @@ class ActionHookManager:
             allow_restore=policy.allow_restore,
             restore_actions=sorted(policy.restore_actions or []),
         )
+
+    def configure_ordered_scheduler(
+        self,
+        config: OrderedHookSchedulerConfig,
+    ) -> None:
+        if self._ordered_session is not None and not self._ordered_session.closed:
+            raise RuntimeError("Cannot reconfigure an active action-hook session")
+        self._ordered_config = config
+
+    async def start_session(self) -> None:
+        """Start ordered session ownership."""
+
+        if self._ordered_session is not None and not self._ordered_session.closed:
+            return
+        from useagent.action_hook_scheduler import ActionHookSession
+
+        config = self._ordered_config
+        if config is None:
+            from useagent.action_hook_settings import get_action_hook_settings
+
+            config = OrderedHookSchedulerConfig.from_settings(
+                get_action_hook_settings()
+            )
+        session = ActionHookSession(
+            registrations=tuple(self._registrations),
+            policy=self._policy,
+            config=config,
+            diagnostic=self.record_diagnostic,
+        )
+        await session.start()
+        self._ordered_session = session
+
+    async def begin_action(
+        self,
+        action_name: TopLevelActionName,
+        ctx: RunContext[TaskState],
+    ) -> ActionCheckpoint | None:
+        await self.start_session()
+        assert self._ordered_session is not None
+        try:
+            return await self._ordered_session.begin_action(action_name, ctx)
+        except ActionHookSchedulerError:
+            self.raise_if_intervention(current_messages=ctx.messages)
+            raise
+
+    async def finish_action(
+        self,
+        *,
+        checkpoint: ActionCheckpoint | None,
+        action_args: dict[str, Any],
+        result: Any = None,
+        error: BaseException | None = None,
+        current_task_state: TaskState,
+        current_messages: list[ModelMessage] | None = None,
+    ) -> None:
+        if checkpoint is None:
+            return
+        await self.start_session()
+        assert self._ordered_session is not None
+        await self._ordered_session.finish_action(
+            checkpoint=checkpoint,
+            action_args=action_args,
+            result=result,
+            error=error,
+            current_task_state=current_task_state,
+        )
+
+    async def before_tool_approval(
+        self,
+        tool_name: str,
+        current_messages: list[ModelMessage] | None = None,
+    ) -> None:
+        await self.start_session()
+        assert self._ordered_session is not None
+        await self._ordered_session.before_tool_approval(tool_name)
+        self.raise_if_intervention(current_messages=current_messages)
+
+    async def protocol_finalized(
+        self,
+        tool_call_id: str,
+        messages: list[ModelMessage],
+    ) -> None:
+        await self.start_session()
+        assert self._ordered_session is not None
+        await self._ordered_session.protocol_finalized(tool_call_id, messages)
+
+    async def invalidate_action(
+        self,
+        checkpoint: ActionCheckpoint | None = None,
+        *,
+        tool_call_id: str | None = None,
+    ) -> None:
+        if self._ordered_session is None:
+            return
+        await self._ordered_session.invalidate_action(
+            checkpoint=checkpoint,
+            tool_call_id=tool_call_id,
+        )
+
+    async def final_drain(self) -> None:
+        await self.start_session()
+        assert self._ordered_session is not None
+        await self._ordered_session.final_drain()
+
+    async def prepare_intervention(
+        self,
+        request: ActionInterventionRequest,
+    ) -> None:
+        if self._ordered_session is None:
+            return
+        await self._ordered_session.prepare_intervention(request.checkpoint.id)
+
+    async def cancel_and_close(self, *, clean_snapshots: bool = True) -> None:
+        if self._ordered_session is not None:
+            session = self._ordered_session
+            try:
+                await session.close(clean_snapshots=clean_snapshots)
+            finally:
+                self._ordered_session = None
+
+    def pop_action_error(self, tool_call_id: str) -> BaseException | None:
+        if self._ordered_session is None:
+            return None
+        return self._ordered_session.pop_action_error(tool_call_id)
 
     def record_diagnostic(self, event: str, **fields: Any) -> None:
         self._diagnostics.append(
@@ -241,75 +572,10 @@ class ActionHookManager:
             for item in self._diagnostics:
                 file.write(json.dumps(item, sort_keys=True) + "\n")
 
-    def create_checkpoint(
-        self,
-        action_name: TopLevelActionName,
-        ctx: RunContext[TaskState],
-    ) -> ActionCheckpoint | None:
-        self.raise_if_intervention(current_messages=ctx.messages)
-        if not self.has_hooks:
-            return None
-        return ActionCheckpoint(
-            id=str(uuid4()),
-            action_name=action_name,
-            task_state=copy.deepcopy(ctx.deps),
-            messages=copy.deepcopy(ctx.messages),
-            bash_history_length=len(get_bash_history()),
-            generation=self._generation,
-        )
-
-    def schedule(
-        self,
-        *,
-        checkpoint: ActionCheckpoint | None,
-        action_args: dict[str, Any],
-        result: Any = None,
-        error: BaseException | None = None,
-        current_task_state: TaskState,
-    ) -> None:
-        if checkpoint is None or not self.has_hooks:
-            return
-
-        filesystem_snapshot = None
-        if self._policy.allows_restore(checkpoint.action_name):
-            filesystem_snapshot = create_filesystem_snapshot(current_task_state)
-        if filesystem_snapshot is not None:
-            self._filesystem_snapshots[checkpoint.id] = filesystem_snapshot
-        self._checkpoint_pending_counts[checkpoint.id] = len(self._hooks)
-        self.record_diagnostic(
-            "action_scheduled",
-            action_name=checkpoint.action_name,
-            checkpoint_id=checkpoint.id,
-            has_filesystem_snapshot=filesystem_snapshot is not None,
-            filesystem_snapshot_strategy=(
-                filesystem_snapshot.strategy if filesystem_snapshot is not None else None
-            ),
-            error_type=type(error).__name__ if error is not None else None,
-        )
-        event = ActionHookEvent(
-            action_name=checkpoint.action_name,
-            action_args=action_args,
-            result=result,
-            error=error,
-            checkpoint=checkpoint,
-            current_task_state=copy.deepcopy(current_task_state),
-            current_bash_history_length=len(get_bash_history()),
-            current_filesystem_snapshot=filesystem_snapshot,
-        )
-        for hook in list(self._hooks):
-            token = HookCancellationToken()
-            task = asyncio.create_task(
-                self._run_hook(hook, event, token),
-                name=f"action-hook:{checkpoint.action_name}:{checkpoint.id}",
-            )
-            self._pending[task] = token
-            self._pending_checkpoints[task] = checkpoint.id
-            task.add_done_callback(self._hook_task_done)
-
     def pop_intervention(self) -> ActionInterventionRequest | None:
-        request = self._intervention
-        self._intervention = None
-        return request
+        if self._ordered_session is None:
+            return None
+        return self._ordered_session.pop_intervention()
 
     def raise_if_intervention(
         self, current_messages: list[ModelMessage] | None = None
@@ -327,228 +593,9 @@ class ActionHookManager:
                 )
             raise ActionIntervention(request)
 
-    async def wait_for_checkpoint(self, checkpoint_id: str, timeout_seconds: float) -> None:
-        if timeout_seconds <= 0:
-            return
-        tasks = [
-            task
-            for task, pending_checkpoint_id in self._pending_checkpoints.items()
-            if pending_checkpoint_id == checkpoint_id
-        ]
-        if not tasks:
-            return
-        done, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
-        if pending:
-            self.record_diagnostic(
-                "hook_wait_timeout",
-                checkpoint_id=checkpoint_id,
-                completed_hooks=len(done),
-                pending_hooks=len(pending),
-                timeout_seconds=timeout_seconds,
-            )
-            for task in pending:
-                token = self._pending.pop(task, None)
-                if token is not None:
-                    token.cancel()
-                self._pending_checkpoints.pop(task, None)
-                if not task.done():
-                    task.cancel()
-            self._checkpoint_pending_counts.pop(checkpoint_id, None)
-            if self._intervention is None:
-                self.cleanup_filesystem_snapshot(checkpoint_id)
-
-    def cancel_pending(
-        self,
-        *,
-        clean_snapshots: bool = False,
-        preserve_snapshot_id: str | None = None,
-    ) -> None:
-        pending = list(self._pending.items())
-        self._pending.clear()
-        self._pending_checkpoints.clear()
-        self._checkpoint_pending_counts.clear()
-        for task, token in pending:
-            token.cancel()
-            if not task.done():
-                task.cancel()
-        if clean_snapshots:
-            self.cleanup_filesystem_snapshots(preserve_snapshot_id=preserve_snapshot_id)
-
-    def cleanup_filesystem_snapshots(
-        self,
-        *,
-        preserve_snapshot_id: str | None = None,
-    ) -> None:
-        for checkpoint_id in list(self._filesystem_snapshots):
-            if checkpoint_id == preserve_snapshot_id:
-                continue
-            snapshot = self._filesystem_snapshots.pop(checkpoint_id)
-            cleanup_filesystem_snapshot(snapshot)
-
     def cleanup_filesystem_snapshot(self, checkpoint_id: str) -> None:
-        snapshot = self._filesystem_snapshots.pop(checkpoint_id, None)
-        if snapshot is not None:
-            cleanup_filesystem_snapshot(snapshot)
-
-    def _hook_task_done(self, task: asyncio.Task[None]) -> None:
-        self._pending.pop(task, None)
-        checkpoint_id = self._pending_checkpoints.pop(task, None)
-        if checkpoint_id is None:
-            return
-        remaining = self._checkpoint_pending_counts.get(checkpoint_id, 0) - 1
-        if remaining <= 0:
-            self._checkpoint_pending_counts.pop(checkpoint_id, None)
-            if (
-                self._intervention is None
-                or self._intervention.checkpoint.id != checkpoint_id
-            ):
-                self.cleanup_filesystem_snapshot(checkpoint_id)
-        else:
-            self._checkpoint_pending_counts[checkpoint_id] = remaining
-
-    async def _run_hook(
-        self,
-        hook: ActionHook,
-        event: ActionHookEvent,
-        token: HookCancellationToken,
-    ) -> None:
-        hook_name = _hook_name(hook)
-        start = time.monotonic()
-        try:
-            decision_or_awaitable = hook(event, token)
-            if inspect.isawaitable(decision_or_awaitable):
-                decision = await decision_or_awaitable
-            else:
-                decision = decision_or_awaitable
-        except asyncio.CancelledError:
-            self.record_diagnostic(
-                "hook_cancelled",
-                hook=hook_name,
-                action_name=event.action_name,
-                checkpoint_id=event.checkpoint.id,
-            )
-            raise
-        except Exception as exc:
-            logger.exception(
-                f"[ActionHook] Hook failed after {event.action_name}: {exc}"
-            )
-            self.record_diagnostic(
-                "hook_failed",
-                hook=hook_name,
-                action_name=event.action_name,
-                checkpoint_id=event.checkpoint.id,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-            return
-
-        if token.cancelled or decision is None or decision.kind == "noop":
-            self.record_diagnostic(
-                "hook_completed",
-                hook=hook_name,
-                action_name=event.action_name,
-                checkpoint_id=event.checkpoint.id,
-                decision_kind="noop" if decision is None else decision.kind,
-                reason=None if decision is None else decision.reason,
-                duration_seconds=round(time.monotonic() - start, 6),
-            )
-            return
-        if decision.kind != "intervene":
-            logger.warning(f"[ActionHook] Ignoring unknown decision: {decision}")
-            self.record_diagnostic(
-                "hook_ignored",
-                hook=hook_name,
-                action_name=event.action_name,
-                checkpoint_id=event.checkpoint.id,
-                reason="unknown decision kind",
-            )
-            return
-        if event.checkpoint.generation != self._generation:
-            logger.info(
-                "[ActionHook] Ignoring stale intervention from generation "
-                f"{event.checkpoint.generation}; current generation is "
-                f"{self._generation}"
-            )
-            self.record_diagnostic(
-                "intervention_ignored",
-                hook=hook_name,
-                action_name=event.action_name,
-                checkpoint_id=event.checkpoint.id,
-                reason="stale generation",
-            )
-            return
-        if not decision.instruction:
-            logger.warning("[ActionHook] Ignoring intervention without instruction")
-            self.record_diagnostic(
-                "intervention_ignored",
-                hook=hook_name,
-                action_name=event.action_name,
-                checkpoint_id=event.checkpoint.id,
-                reason="missing instruction",
-            )
-            return
-
-        if self._interventions_ignored_reason is not None:
-            logger.warning(
-                "[ActionHook] Ignoring intervention after "
-                f"{event.action_name}: {self._interventions_ignored_reason}"
-            )
-            self.record_diagnostic(
-                "intervention_ignored",
-                hook=hook_name,
-                action_name=event.action_name,
-                checkpoint_id=event.checkpoint.id,
-                reason=self._interventions_ignored_reason,
-            )
-            return
-
-        if decision.restore_to_checkpoint and not self._policy.allows_restore(
-            event.action_name
-        ):
-            decision = HookDecision.intervene(
-                decision.instruction,
-                reason=decision.reason,
-                additional_knowledge=decision.additional_knowledge,
-                restore_to_checkpoint=False,
-            )
-            self.record_diagnostic(
-                "restore_downgraded",
-                hook=hook_name,
-                action_name=event.action_name,
-                checkpoint_id=event.checkpoint.id,
-                reason="restore disallowed by action hook policy",
-            )
-
-        if self._intervention is None:
-            self._intervention = ActionInterventionRequest(
-                checkpoint=event.checkpoint,
-                decision=decision,
-                restore_task_state=event.current_task_state,
-                restore_bash_history_length=event.current_bash_history_length,
-                restore_filesystem_snapshot=event.current_filesystem_snapshot,
-            )
-            logger.info(
-                "[ActionHook] Queued intervention after "
-                f"{event.action_name}: {decision.reason or decision.instruction}"
-            )
-            self.record_diagnostic(
-                "intervention_queued",
-                hook=hook_name,
-                action_name=event.action_name,
-                checkpoint_id=event.checkpoint.id,
-                reason=decision.reason,
-                restore_to_checkpoint=decision.restore_to_checkpoint,
-                has_filesystem_snapshot=event.current_filesystem_snapshot is not None,
-                duration_seconds=round(time.monotonic() - start, 6),
-            )
-        else:
-            self.record_diagnostic(
-                "intervention_ignored",
-                hook=hook_name,
-                action_name=event.action_name,
-                checkpoint_id=event.checkpoint.id,
-                reason="another intervention is already queued",
-            )
+        if self._ordered_session is not None:
+            self._ordered_session.cleanup_checkpoint_snapshot(checkpoint_id)
 
 
 def restore_task_state_from_checkpoint(
@@ -635,7 +682,13 @@ def restore_filesystem_snapshot(snapshot: FilesystemSnapshot) -> None:
 
 
 def cleanup_filesystem_snapshot(snapshot: FilesystemSnapshot) -> None:
-    shutil.rmtree(snapshot.snapshot_root.parent, ignore_errors=True)
+    snapshot_parent = snapshot.snapshot_root.parent
+    if snapshot_parent.exists():
+        shutil.rmtree(snapshot_parent)
+    if snapshot_parent.exists():
+        raise RuntimeError(
+            f"Filesystem snapshot cleanup left data behind: {snapshot_parent}"
+        )
 
 
 def create_git_filesystem_snapshot(root: Path) -> FilesystemSnapshot | None:
@@ -659,9 +712,7 @@ def create_git_filesystem_snapshot(root: Path) -> FilesystemSnapshot | None:
         staged_patch.write_bytes(
             _git_bytes(root, "diff", "--binary", "--full-index", "--cached")
         )
-        unstaged_patch.write_bytes(
-            _git_bytes(root, "diff", "--binary", "--full-index")
-        )
+        unstaged_patch.write_bytes(_git_bytes(root, "diff", "--binary", "--full-index"))
         untracked_root = snapshot_root / "untracked"
         _copy_untracked_files(root, untracked_root)
         symbolic_head = _git_output(root, "symbolic-ref", "-q", "HEAD", check=False)
@@ -680,9 +731,7 @@ def create_git_filesystem_snapshot(root: Path) -> FilesystemSnapshot | None:
             git_snapshot=git_snapshot,
         )
     except Exception as exc:
-        logger.warning(
-            f"[ActionHook] Could not create Git filesystem snapshot: {exc}"
-        )
+        logger.warning(f"[ActionHook] Could not create Git filesystem snapshot: {exc}")
         shutil.rmtree(snapshot_parent, ignore_errors=True)
         return None
 
@@ -833,26 +882,11 @@ def configure_action_hook_policy_from_environment(
     )
 
 
-def action_hook_wait_seconds() -> float:
-    return _env_float("USEAGENT_ACTION_HOOK_WAIT_SECONDS", default=0.0, minimum=0.0)
-
-
 def _env_flag(name: str, *, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
     return value.strip().lower() not in {"0", "false", "no", "off"}
-
-
-def _env_float(name: str, *, default: float, minimum: float) -> float:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        parsed = float(value)
-    except ValueError:
-        return default
-    return max(minimum, parsed)
 
 
 ACTION_HOOK_MANAGER = ActionHookManager()
@@ -886,7 +920,13 @@ def load_action_hook_spec(spec: str) -> ActionHook:
 def register_action_hook_specs(specs: list[str]) -> int:
     registered = 0
     for spec in specs:
-        ACTION_HOOK_MANAGER.register(load_action_hook_spec(spec))
+        hook = load_action_hook_spec(spec)
+        options = getattr(hook, "__useagent_hook_options__", None)
+        if options is not None and not isinstance(options, HookOptions):
+            raise TypeError(
+                "__useagent_hook_options__ must be a useagent.action_hooks.HookOptions"
+            )
+        ACTION_HOOK_MANAGER.register(hook, options=options)
         registered += 1
     return registered
 
@@ -933,20 +973,30 @@ def _load_command_hook_spec(command: str) -> ActionHook:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name == "posix",
         )
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(json.dumps(payload).encode("utf-8")),
                 timeout=constants.ACTION_HOOK_COMMAND_TIMEOUT_SECONDS,
             )
+        except asyncio.CancelledError:
+            cleanup_task = asyncio.create_task(
+                _terminate_command_hook_process(proc),
+                name=f"action-hook-command-cleanup:{proc.pid}",
+            )
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await cleanup_task
+            raise
         except TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await _terminate_command_hook_process(proc)
             logger.warning(
                 "[ActionHook] Command hook timed out after "
                 f"{constants.ACTION_HOOK_COMMAND_TIMEOUT_SECONDS}s: {command}"
             )
-            return HookDecision.noop("command hook timed out")
+            raise RuntimeError("command hook timed out")
 
         stderr_text = stderr.decode("utf-8", errors="replace").strip()
         if proc.returncode != 0:
@@ -954,9 +1004,7 @@ def _load_command_hook_spec(command: str) -> ActionHook:
                 "[ActionHook] Command hook failed with exit code "
                 f"{proc.returncode}: {command}\n{stderr_text}"
             )
-            return HookDecision.noop(
-                f"command hook failed with exit code {proc.returncode}"
-            )
+            raise RuntimeError(f"command hook failed with exit code {proc.returncode}")
 
         output = stdout.decode("utf-8", errors="replace").strip()
         if not output or token.cancelled:
@@ -965,15 +1013,62 @@ def _load_command_hook_spec(command: str) -> ActionHook:
             data = json.loads(output)
         except json.JSONDecodeError as exc:
             logger.warning(f"[ActionHook] Command hook returned invalid JSON: {exc}")
-            return HookDecision.noop("command hook returned invalid JSON")
+            raise RuntimeError("command hook returned invalid JSON") from exc
         return _decision_from_payload(data)
 
     command_hook.__name__ = f"command_hook:{shlex.split(command)[0] if command else ''}"
+    setattr(
+        command_hook,
+        "__useagent_hook_options__",
+        HookOptions(execution="process"),
+    )
     return command_hook
+
+
+async def _terminate_command_hook_process(
+    proc: asyncio.subprocess.Process,
+) -> None:
+    if proc.returncode is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:  # pragma: no cover - exercised on non-POSIX runners
+            proc.terminate()
+    except ProcessLookupError:
+        pass
+
+    try:
+        await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=1.0)
+    except TimeoutError:
+        pass
+
+    try:
+        if os.name == "posix":
+            # The shell may exit on SIGTERM while a descendant ignores it.
+            # Re-signal the original process group even when the leader has
+            # already been reaped.
+            os.killpg(proc.pid, signal.SIGKILL)
+        elif proc.returncode is None:  # pragma: no cover - non-POSIX runners
+            proc.kill()
+    except ProcessLookupError:
+        pass
+    if proc.returncode is None:
+        await proc.wait()
 
 
 def _event_payload(event: ActionHookEvent) -> dict[str, Any]:
     return {
+        "session_id": event.session_id,
+        "epoch": event.epoch,
+        "action_seq": event.action_seq,
+        "hook_job_id": event.hook_job_id,
+        "workspace_revision_id": event.workspace_revision_id,
+        "analysis_workspace": (
+            str(event.analysis_workspace)
+            if event.analysis_workspace is not None
+            else None
+        ),
         "action_name": event.action_name,
         "action_args": event.action_args,
         "result": event.result,
@@ -990,6 +1085,10 @@ def _event_payload(event: ActionHookEvent) -> dict[str, Any]:
             "action_name": event.checkpoint.action_name,
             "generation": event.checkpoint.generation,
             "created_at": event.checkpoint.created_at.isoformat(),
+            "session_id": event.checkpoint.session_id,
+            "epoch": event.checkpoint.epoch,
+            "action_seq": event.checkpoint.action_seq,
+            "tool_call_id": event.checkpoint.tool_call_id,
         },
         "task_state": event.current_task_state,
         "task_state_summary": event.current_task_state.to_model_repr(),
@@ -1010,29 +1109,16 @@ def _decision_from_payload(data: Any) -> HookDecision | None:
         raise ValueError("Command hook JSON response must be an object")
     kind = data.get("kind", "noop")
     if kind == "noop":
-        return HookDecision.noop(_optional_str(data.get("reason")))
+        return HookDecision.noop(data.get("reason"))
     if kind == "intervene":
         instruction = data.get("instruction")
-        if not isinstance(instruction, str) or not instruction.strip():
-            raise ValueError("Command hook intervention needs a string instruction")
-        additional_knowledge = data.get("additional_knowledge") or {}
-        if not isinstance(additional_knowledge, dict):
-            raise ValueError("additional_knowledge must be an object")
         return HookDecision.intervene(
             instruction,
-            reason=_optional_str(data.get("reason")),
-            additional_knowledge={
-                str(key): str(value) for key, value in additional_knowledge.items()
-            },
-            restore_to_checkpoint=bool(data.get("restore_to_checkpoint", True)),
+            reason=data.get("reason"),
+            additional_knowledge=data.get("additional_knowledge"),
+            restore_to_checkpoint=data.get("restore_to_checkpoint", True),
         )
     raise ValueError(f"Unknown command hook decision kind: {kind}")
-
-
-def _optional_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    return str(value)
 
 
 def _safe_jsonable(value: Any) -> Any:

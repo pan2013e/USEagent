@@ -8,6 +8,14 @@ from typing import Literal
 from loguru import logger
 
 from useagent import task_runner
+from useagent.action_hook_settings import (
+    ACTION_HOOK_SCHEDULERS,
+    OBSERVER_OVERFLOW_POLICIES,
+    configure_action_hook_settings,
+    parse_nonnegative_float,
+    parse_positive_float,
+    parse_positive_int,
+)
 from useagent.action_hooks import (
     configure_action_hook_policy_from_environment,
     parse_action_hook_spec_list,
@@ -97,6 +105,84 @@ def add_common_args(parser: ArgumentParser) -> None:
             "restore checkpoints. Defaults to USEAGENT_ACTION_HOOK_RESTORE_ACTIONS "
             "or all actions."
         ),
+    )
+    parser.add_argument(
+        "--action-hook-scheduler",
+        choices=ACTION_HOOK_SCHEDULERS,
+        default=None,
+        help=(
+            "Action-hook scheduler mode. Only ordered scheduling is supported; "
+            "the option defaults to USEAGENT_ACTION_HOOK_SCHEDULER or ordered."
+        ),
+    )
+    parser.add_argument(
+        "--action-hook-max-concurrent-runs",
+        type=parse_positive_int,
+        default=None,
+        metavar="N",
+        help="Maximum number of concurrently running action hooks.",
+    )
+    parser.add_argument(
+        "--action-hook-max-unretired-actions",
+        type=parse_positive_int,
+        default=None,
+        metavar="N",
+        help="Maximum number of admitted gate actions awaiting retirement.",
+    )
+    parser.add_argument(
+        "--action-hook-run-timeout-seconds",
+        type=parse_positive_float,
+        default=None,
+        metavar="S",
+        help="Per-job runtime limit after a hook worker starts the job.",
+    )
+    parser.add_argument(
+        "--action-hook-post-action-patience-seconds",
+        type=parse_nonnegative_float,
+        default=None,
+        metavar="S",
+        help="Optional post-action wait before speculative execution may continue.",
+    )
+    parser.add_argument(
+        "--action-hook-intervention-quiesce-seconds",
+        type=parse_positive_float,
+        default=None,
+        metavar="S",
+        help="Deadline for active work to reach an intervention-safe boundary.",
+    )
+    parser.add_argument(
+        "--action-hook-cleanup-seconds",
+        type=parse_positive_float,
+        default=None,
+        metavar="S",
+        help="Deadline for terminating hook-owned resources.",
+    )
+    parser.add_argument(
+        "--action-hook-finalize-seconds",
+        type=parse_nonnegative_float,
+        default=None,
+        metavar="S",
+        help="Deadline for the final mandatory gate-hook drain.",
+    )
+    parser.add_argument(
+        "--action-hook-snapshot-budget-mib",
+        type=parse_positive_float,
+        default=None,
+        metavar="M",
+        help="Maximum aggregate action-hook snapshot size in MiB.",
+    )
+    parser.add_argument(
+        "--action-hook-observer-queue-capacity",
+        type=parse_positive_int,
+        default=None,
+        metavar="N",
+        help="Default bounded queue capacity for every-event observers.",
+    )
+    parser.add_argument(
+        "--action-hook-observer-overflow",
+        choices=OBSERVER_OVERFLOW_POLICIES,
+        default=None,
+        help="Default observer queue overflow policy.",
     )
 
 
@@ -203,7 +289,7 @@ def _get_task_description(args: Namespace) -> str:
     raise ValueError("Invalid task file")
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None) -> tuple[Namespace, str]:
     parser = ArgumentParser()
 
     subparser_dest_attr_name = "command"
@@ -231,7 +317,7 @@ def parse_args():
     )
     set_swebench_parser_args(swebench_parser)
 
-    return parser.parse_args(), subparser_dest_attr_name
+    return parser.parse_args(argv), subparser_dest_attr_name
 
 
 def handle_command(args: Namespace, subparser_dest_attr_name: str) -> None:
@@ -346,6 +432,19 @@ def parse_output_type(value: str) -> Literal[Answer, CodeChange, Action]:
 def main():
     args, subparser_dest_attr_name = parse_args()
     setup_loguru(console_log_level=args.log_level, log_file=args.log_file)
+    configure_action_hook_settings(
+        scheduler=args.action_hook_scheduler,
+        max_concurrent_runs=args.action_hook_max_concurrent_runs,
+        max_unretired_actions=args.action_hook_max_unretired_actions,
+        run_timeout_seconds=args.action_hook_run_timeout_seconds,
+        post_action_patience_seconds=args.action_hook_post_action_patience_seconds,
+        intervention_quiesce_seconds=args.action_hook_intervention_quiesce_seconds,
+        cleanup_seconds=args.action_hook_cleanup_seconds,
+        finalize_seconds=args.action_hook_finalize_seconds,
+        snapshot_budget_mib=args.action_hook_snapshot_budget_mib,
+        observer_queue_capacity=args.action_hook_observer_queue_capacity,
+        observer_overflow=args.action_hook_observer_overflow,
+    )
     build_and_register_config(args)
     configure_action_hook_policy_from_environment(
         allow_restore=False if args.action_hook_disable_restore else None,

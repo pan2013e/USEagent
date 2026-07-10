@@ -18,7 +18,6 @@ MAX_DOUBT_REITERATIONS: Final[int] = (
 
 MAX_ACTION_HOOK_INTERVENTIONS: Final[int] = 100
 ACTION_HOOK_COMMAND_TIMEOUT_SECONDS: Final[float] = 120.0
-ACTION_HOOK_CANCELLATION_POLL_SECONDS: Final[float] = 0.25
 
 # =============================================================
 #                 Agent and Pydantic Constants

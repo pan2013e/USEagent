@@ -2395,6 +2395,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
+    { name = "httpx" },
     { name = "loguru" },
     { name = "pydantic-ai" },
     { name = "sentencepiece" },
@@ -2424,6 +2425,7 @@ usebench = [
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = "==25.1.0" },
     { name = "datasets", specifier = ">=3.1.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "isort", marker = "extra == 'dev'", specifier = "==6.0.1" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = "==4.2.0" },
