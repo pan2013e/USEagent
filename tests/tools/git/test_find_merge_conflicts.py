@@ -49,7 +49,21 @@ def test_nonexistent_directory_raises():
 
 
 @pytest.mark.tool
-def test_file_input_raises(tmp_path: Path):
+def test_file_input_with_conflict_is_supported(tmp_path: Path):
     f = _create_file(tmp_path / "somefile.txt", "<<<<<<< HEAD\nconflict")
-    with pytest.raises(ValueError):
-        find_merge_conflicts(f)
+
+    assert find_merge_conflicts(f) == [f]
+
+
+@pytest.mark.tool
+def test_file_input_without_conflict_is_supported(tmp_path: Path):
+    f = _create_file(tmp_path / "clean.txt", "no conflict")
+
+    assert find_merge_conflicts(f) == []
+
+
+@pytest.mark.tool
+def test_restructuredtext_heading_separator_is_not_a_conflict(tmp_path: Path):
+    _create_file(tmp_path / "documentation.rst", "Heading\n=======\nBody\n")
+
+    assert find_merge_conflicts(tmp_path) == []

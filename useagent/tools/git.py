@@ -60,7 +60,10 @@ def check_for_merge_conflict_markers(
         return False
     with open(abs_path_to_file, encoding="utf-8") as f:
         for line in f:
-            if line.startswith(("<<<<<<<", "=======", ">>>>>>>")):
+            # A separator-only ``=======`` line is common in documentation
+            # formats such as reStructuredText. Conflict starts, ends, and
+            # diff3 ancestor markers are unambiguous even for partial merges.
+            if line.startswith(("<<<<<<<", "|||||||", ">>>>>>>")):
                 logger.info(f"[Tool] Found Merge conflict marker in {abs_path_to_file}")
                 return True
     # No Merge Conflicts Found
@@ -69,10 +72,10 @@ def check_for_merge_conflict_markers(
 
 def find_merge_conflicts(path_to_check: Path) -> list[Path]:
     """
-    Iterate over the given path to a folder, and look for any file that contains a merge marker.
+    Inspect one file or recursively inspect a folder for merge markers.
 
     Args:
-        path_to_check (Path): The path pointing to a folder to investigate.
+        path_to_check (Path): A file or folder to investigate.
 
     Returns:
         List[Path]: A list of all files that contain at least one merge marker. Can be empty if there are none.
@@ -86,9 +89,18 @@ def find_merge_conflicts(path_to_check: Path) -> list[Path]:
     if not abs_path_to_check.exists():
         raise ValueError(f"The path {abs_path_to_check} does not exist")
     if abs_path_to_check.is_file():
-        raise ValueError(
-            f"Received a path_to_check {abs_path_to_check} that points to a file, but a folder is expected."
+        conflict_files = (
+            [abs_path_to_check]
+            if check_for_merge_conflict_markers(
+                abs_path_to_check, _silence_logger=True
+            )
+            else []
         )
+        logger.info(
+            f"[Tool] Found {len(conflict_files)} files with merge conflicts "
+            f"within {path_to_check}"
+        )
+        return conflict_files
 
     conflict_files: list[Path] = []
     for root, _, files in os.walk(abs_path_to_check):
