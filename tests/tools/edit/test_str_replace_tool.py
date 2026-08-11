@@ -23,6 +23,20 @@ async def test_str_replace_success(tmp_path: Path):
 
 @pytest.mark.tool
 @pytest.mark.asyncio
+async def test_str_replace_identical_strings_is_a_noop(tmp_path: Path):
+    init_edit_tools(str(tmp_path))
+    file = tmp_path / "same.txt"
+    file.write_text("already correct")
+
+    result = await str_replace(str(file), "already", "already")
+
+    assert isinstance(result, ToolErrorInfo)
+    assert "identical" in result.message
+    assert file.read_text() == "already correct"
+
+
+@pytest.mark.tool
+@pytest.mark.asyncio
 async def test_str_replace_tabs_handled(tmp_path: Path):
     init_edit_tools(str(tmp_path))
     file = tmp_path / "tabs.txt"

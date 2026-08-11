@@ -16,6 +16,8 @@ from useagent.pydantic_models.tools.errorinfo import ArgumentEntry, ToolErrorInf
 from useagent.tools.run import maybe_truncate, run
 
 SNIPPET_LINES: int = 4
+LARGE_FILE_MIN_LINES: int = 100
+LARGE_FILE_MAX_IMPLICIT_DELETION_RATIO: float = 0.25
 
 _project_dir: Path | None = None
 
@@ -298,6 +300,16 @@ async def str_replace(file_path: str, old_str: str, new_str: str):
 
     new_str = new_str.expandtabs()
 
+    if old_str == new_str:
+        return ToolErrorInfo(
+            message=(
+                f"No replacement was performed in {file_path} because old_str "
+                "and new_str are identical. If the requested change is already "
+                "present, extract the current diff instead of editing it again."
+            ),
+            supplied_arguments=supplied_arguments,
+        )
+
     occurrences = file_content.count(old_str)
     if occurrences == 0:
         return ToolErrorInfo(
@@ -334,7 +346,11 @@ async def str_replace(file_path: str, old_str: str, new_str: str):
     return CLIResult(output=success_msg)
 
 
-def replace_file(file_content: str, file_path: str | Path) -> CLIResult | ToolErrorInfo:
+def replace_file(
+    file_content: str,
+    file_path: str | Path,
+    allow_large_deletion: bool = False,
+) -> CLIResult | ToolErrorInfo:
     """
     Fully replaces a given file with a completely new string.
     The old file content is completely discarded in favour of the new file_content.
@@ -343,6 +359,8 @@ def replace_file(file_content: str, file_path: str | Path) -> CLIResult | ToolEr
     Args:
         file_path (str | pathlib.Path): The path to the file where the replacement will occur.
         file_content (str): The string that will contain.
+        allow_large_deletion (bool): Explicitly permit replacing a large existing
+            file with content that removes more than 25 percent of its lines.
 
     Returns:
         CLIResult: The result of the replacement operation, containing a confirmation or error.
@@ -358,6 +376,7 @@ def replace_file(file_content: str, file_path: str | Path) -> CLIResult | ToolEr
                 "file_content",
                 str(file_content[:50] + ("..." if len(file_content) > 50 else "")),
             ),
+            ArgumentEntry("allow_large_deletion", str(allow_large_deletion)),
         ]
     except ValueError:
         supplied_arguments = []
@@ -393,6 +412,39 @@ def replace_file(file_content: str, file_path: str | Path) -> CLIResult | ToolEr
     if path.is_dir():
         return ToolErrorInfo(
             message=f"Filepath {file_path} is a directory - `replace_file` can only be applied to files.",
+            supplied_arguments=supplied_arguments,
+        )
+
+    current_content = _read_file(path)
+    if isinstance(current_content, ToolErrorInfo):
+        return current_content
+    if current_content == file_content:
+        return ToolErrorInfo(
+            message=(
+                f"No replacement was performed in {file_path} because the "
+                "supplied content is identical to the existing file. Extract "
+                "the current diff instead of rewriting the file."
+            ),
+            supplied_arguments=supplied_arguments,
+        )
+
+    current_line_count = current_content.count("\n") + 1
+    replacement_line_count = file_content.count("\n") + 1
+    deleted_line_count = current_line_count - replacement_line_count
+    deletion_ratio = deleted_line_count / current_line_count
+    if (
+        current_line_count >= LARGE_FILE_MIN_LINES
+        and deletion_ratio > LARGE_FILE_MAX_IMPLICIT_DELETION_RATIO
+        and not allow_large_deletion
+    ):
+        return ToolErrorInfo(
+            message=(
+                f"Replacement blocked because it would shrink {file_path} from "
+                f"{current_line_count} to {replacement_line_count} lines "
+                f"({deletion_ratio:.0%} removed). Use a targeted edit for a "
+                "local change. Retry with allow_large_deletion=true only when "
+                "the task intentionally requires this broad deletion."
+            ),
             supplied_arguments=supplied_arguments,
         )
 

@@ -22,6 +22,48 @@ def test_replace_file_success_should_replace_file_content(tmp_path: Path):
 
 
 @pytest.mark.tool
+def test_replace_file_identical_content_is_a_noop(tmp_path: Path):
+    init_edit_tools(str(tmp_path))
+    file = tmp_path / "same.txt"
+    file.write_text("already correct")
+
+    result = replace_file("already correct", str(file))
+
+    assert isinstance(result, ToolErrorInfo)
+    assert "identical" in result.message
+    assert file.read_text() == "already correct"
+
+
+@pytest.mark.tool
+def test_replace_file_blocks_unintentional_large_deletion(tmp_path: Path):
+    init_edit_tools(str(tmp_path))
+    file = tmp_path / "large.txt"
+    original = "\n".join(f"line {index}" for index in range(120))
+    replacement = "\n".join(f"line {index}" for index in range(40))
+    file.write_text(original)
+
+    result = replace_file(replacement, str(file))
+
+    assert isinstance(result, ToolErrorInfo)
+    assert "Replacement blocked" in result.message
+    assert file.read_text() == original
+
+
+@pytest.mark.tool
+def test_replace_file_allows_explicit_large_deletion(tmp_path: Path):
+    init_edit_tools(str(tmp_path))
+    file = tmp_path / "large.txt"
+    original = "\n".join(f"line {index}" for index in range(120))
+    replacement = "\n".join(f"line {index}" for index in range(40))
+    file.write_text(original)
+
+    result = replace_file(replacement, str(file), allow_large_deletion=True)
+
+    assert isinstance(result, CLIResult)
+    assert file.read_text() == replacement
+
+
+@pytest.mark.tool
 def test_replace_file_nonexistent_path_should_return_tool_error_info(tmp_path: Path):
     init_edit_tools(str(tmp_path))
     file = tmp_path / "missing.txt"
