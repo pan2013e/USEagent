@@ -523,10 +523,28 @@ async def edit_code(
 
     except UsageLimitExceeded as usage_exc:
         logger.error(
-            f"[MetaAgent] `edit_code` failed due to number of requests {usage_exc}, returning a ToolErrorInfo about it"
+            f"[MetaAgent] `edit_code` reached its request limit {usage_exc}; "
+            "capturing any current working-tree patch"
         )
+        recovered = await ensure_current_diff(ctx.deps.diff_store)
+        if not isinstance(recovered, ToolErrorInfo):
+            logger.warning(
+                f"[MetaAgent] Recovered request-limited edit as {recovered}"
+            )
+            await _finish_top_level_action(
+                checkpoint,
+                ctx,
+                {"instruction": instruction},
+                result=recovered,
+            )
+            return recovered
         result = ToolErrorInfo(
-            message="There have been issue following your instructions for `edit_code`. Either they have been too complex or too vague, or they caused an issue within the pydantic_ai framework. Reconsider your instructions and consider doing `step-by-step` changes. If the task is in a corrupted / poor state (e.g. a file was deleted that should not be), try to restore a good state of the project before editing again."
+            message=(
+                "There have been issues following your instructions for "
+                "`edit_code`, and no current working-tree patch could be "
+                f"captured: {recovered.message} Reconsider your instructions "
+                "and use smaller step-by-step changes."
+            )
         )
         await _finish_top_level_action(
             checkpoint,

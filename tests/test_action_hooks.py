@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 from pydantic_ai import RunContext
-from pydantic_ai.exceptions import ModelRetry
+from pydantic_ai.exceptions import ModelRetry, UsageLimitExceeded
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
@@ -1022,6 +1022,50 @@ async def test_edit_code_success_finalization_failure_is_not_finalized_twice(
             "error": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_edit_code_request_limit_recovers_current_diff(
+    monkeypatch,
+    tmp_path,
+):
+    ctx = make_context(tmp_path)
+    meta.USAGE_TRACKER = UsageTracker()
+    finish_results: list[object] = []
+
+    class RequestLimitedEditAgent:
+        name = "EDIT"
+
+        async def run(self, *args, **kwargs):
+            raise UsageLimitExceeded("request limit reached")
+
+    async def recover_current_diff(diff_store):
+        assert diff_store is ctx.deps.diff_store
+        return "diff_0"
+
+    async def record_finalization(
+        checkpoint,
+        actual_ctx,
+        action_args,
+        *,
+        result=None,
+        error=None,
+    ):
+        assert actual_ctx is ctx
+        assert action_args == {"instruction": "make a bounded edit"}
+        assert error is None
+        finish_results.append(result)
+
+    monkeypatch.setattr(
+        meta, "init_edit_code_agent", lambda: RequestLimitedEditAgent()
+    )
+    monkeypatch.setattr(meta, "ensure_current_diff", recover_current_diff)
+    monkeypatch.setattr(meta, "_finish_top_level_action", record_finalization)
+
+    result = await meta.edit_code(ctx, "make a bounded edit")
+
+    assert result == "diff_0"
+    assert finish_results == ["diff_0"]
 
 
 @pytest.mark.asyncio
