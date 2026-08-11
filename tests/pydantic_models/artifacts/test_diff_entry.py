@@ -1160,7 +1160,8 @@ index 1010101..2020202 100644
 
 
 def test_trailing_single_space_context_line_should_validate():
-    assert _is_valid_patch(TRAILING_SINGLE_SPACE_CONTEXT_END) is True
+    entry = DiffEntry(diff_content=TRAILING_SINGLE_SPACE_CONTEXT_END)
+    assert entry.diff_content == TRAILING_SINGLE_SPACE_CONTEXT_END
 
 
 TRAILING_SINGLE_SPACE_CONTEXT_END_CRLF = (

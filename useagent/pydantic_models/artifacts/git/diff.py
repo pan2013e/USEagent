@@ -5,7 +5,6 @@ from pydantic import computed_field, field_validator
 from pydantic.dataclasses import dataclass
 
 from useagent.common.patch_validation import _is_valid_patch
-from useagent.pydantic_models.common.constrained_types import NonEmptyStr
 
 
 @dataclass(frozen=True)
@@ -17,7 +16,7 @@ class DiffEntry:
     Important: This is a `git diff`, not a (gnu) `diff`.
     """
 
-    diff_content: NonEmptyStr
+    diff_content: str
 
     @classmethod
     def get_output_instructions(cls) -> str:
@@ -57,10 +56,14 @@ class DiffEntry:
     def has_no_newline_eof_marker(self) -> bool:
         return "\\ No newline at end of file" in self.diff_content
 
-    @field_validator("diff_content")
-    def validate_git_patch(cls, v: str) -> str:
-        patch: str = v
-        if not _is_valid_patch(patch):
-            logger.debug("Patch validation failed for:\n{}", patch)
+    @field_validator("diff_content", mode="before")
+    @classmethod
+    def validate_git_patch(cls, v: object) -> str:
+        if not isinstance(v, str):
+            raise TypeError("Expected str")
+        if not v.strip():
+            raise ValueError("Patch must not be empty or whitespace-only")
+        if not _is_valid_patch(v):
+            logger.debug("Patch validation failed for:\n{}", v)
             raise ValueError("Invalid git patch format")
         return v
