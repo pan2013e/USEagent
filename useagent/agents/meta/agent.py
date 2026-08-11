@@ -65,6 +65,7 @@ from useagent.tools.bash import (
     make_bash_tool_for_agent,
 )
 from useagent.tools.edit import init_edit_tools
+from useagent.tools.git import ensure_current_diff
 from useagent.tools.meta import (  # Agent-State Tools; Agent-Agent Tools
     ORDERED_ACTION_ERROR_PREFIX,
     _gather_checklist,
@@ -103,6 +104,34 @@ def _has_real_doubts(doubts: str | None) -> bool:
         return False
     cleaned = doubts.strip().rstrip(".").lower()
     return cleaned not in _NO_DOUBT_PREFIXES
+
+
+async def _resolve_code_change_diff(
+    task_state: TaskState, code_change: CodeChange
+) -> DiffEntry:
+    """Resolve a final diff key, recovering the live patch when necessary."""
+    diff_entry = task_state.diff_store.id_to_diff.get(code_change.diff_id)  # type: ignore
+    if diff_entry is not None:
+        return diff_entry
+
+    missing_diff_id = code_change.diff_id
+    logger.warning(
+        f"[Post-Processing] Diff key {missing_diff_id} is missing; "
+        "capturing the current working-tree patch"
+    )
+    recovered = await ensure_current_diff(task_state.diff_store)
+    if isinstance(recovered, ToolErrorInfo):
+        raise RuntimeError(
+            f"Final diff key {missing_diff_id} was not stored and the current "
+            f"working-tree patch could not be captured: {recovered.message}"
+        )
+
+    code_change.diff_id = recovered
+    logger.info(
+        f"[Post-Processing] Recovered missing diff key {missing_diff_id} "
+        f"as {recovered}"
+    )
+    return task_state.diff_store.id_to_diff[recovered]  # type: ignore
 
 
 async def _apply_action_hook_intervention(
@@ -754,25 +783,15 @@ async def agent_loop(
     if isinstance(result.output, CodeChange):
         diff_id = result.output.diff_id
         logger.info(f"[Post-Processing] Resolving {diff_id} in DiffStore:")
-        try:
-            diff_entry: DiffEntry | None = task_state.diff_store.id_to_diff[diff_id]  # type: ignore
-            diff_content: str = (
-                diff_entry.diff_content
-                if diff_entry
-                else f"FAILED to retrieve diff_content for diff_id {diff_id}"
-            )
-            if diff_content and output_dir:
-                patch_file = output_dir / "patch.diff"
-                patch_file.parent.mkdir(parents=True, exist_ok=True)
-                patch_file.write_text(diff_content)
-                logger.debug(f"[Post-Processing] Wrote chosen patch to {patch_file}")
-            if output_dir and isinstance(task_state._task, SWEbenchTask):
-                task_state._task.postprocess_swebench_task(diff_content, output_dir)
-        except Exception as e:
-            logger.error(
-                f"[Post-Processing] Issue finding {diff_id} in DiffStore {task_state.diff_store}"
-            )
-            logger.error(e)
+        diff_entry = await _resolve_code_change_diff(task_state, result.output)
+        diff_content = diff_entry.diff_content
+        if output_dir:
+            patch_file = output_dir / "patch.diff"
+            patch_file.parent.mkdir(parents=True, exist_ok=True)
+            patch_file.write_text(diff_content)
+            logger.debug(f"[Post-Processing] Wrote chosen patch to {patch_file}")
+        if output_dir and isinstance(task_state._task, SWEbenchTask):
+            task_state._task.postprocess_swebench_task(diff_content, output_dir)
 
     return result.output, USAGE_TRACKER, result.all_messages()
 

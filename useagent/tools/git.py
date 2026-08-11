@@ -10,7 +10,7 @@ from pydantic_ai import RunContext
 from useagent.common.encoding import is_utf_8_encoded
 from useagent.config import ConfigSingleton
 from useagent.pydantic_models.artifacts.git.diff import DiffEntry
-from useagent.pydantic_models.artifacts.git.diff_store import DiffEntryKey
+from useagent.pydantic_models.artifacts.git.diff_store import DiffEntryKey, DiffStore
 from useagent.pydantic_models.common.constrained_types import NonEmptyStr
 from useagent.pydantic_models.task_state import TaskState
 from useagent.pydantic_models.tools.errorinfo import ArgumentEntry, ToolErrorInfo
@@ -276,6 +276,40 @@ async def extract_diff(
     except Exception as ex:
         return ToolErrorInfo(
             message=f"Unhandled exception during diff-extraction ({ex})",
+            supplied_arguments=[
+                ArgumentEntry("paths_to_extract", str(paths_to_extract))
+            ],
+        )
+
+
+async def ensure_current_diff(
+    diff_store: DiffStore,
+    paths_to_extract: str | Path | Sequence[str | Path] | None = None,
+) -> DiffEntryKey | ToolErrorInfo:
+    """Return a valid key for the current working-tree patch.
+
+    Unlike the agent-facing :func:`extract_diff`, this recovery path reuses an
+    existing equivalent entry.  It is intended for deterministic validation
+    when an agent returns a syntactically valid diff key that is not actually
+    present in the store.
+    """
+    extract_result = await _extract_diff(
+        exclude_hidden_folders_and_files_from_diff=True,
+        paths_to_extract=paths_to_extract,
+    )
+    if isinstance(extract_result, ToolErrorInfo):
+        return extract_result
+
+    normalized = extract_result.diff_content.strip()
+    for diff_id, entry in diff_store.id_to_diff.items():  # type: ignore
+        if entry.diff_content.strip() == normalized:
+            return diff_id
+
+    try:
+        return diff_store._add_entry(extract_result)
+    except Exception as exc:
+        return ToolErrorInfo(
+            message=f"Unable to store the current working-tree diff ({exc})",
             supplied_arguments=[
                 ArgumentEntry("paths_to_extract", str(paths_to_extract))
             ],

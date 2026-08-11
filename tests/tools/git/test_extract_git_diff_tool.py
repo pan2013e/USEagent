@@ -11,7 +11,7 @@ from useagent.pydantic_models.task_state import TaskState
 from useagent.pydantic_models.tools.errorinfo import ToolErrorInfo
 from useagent.state.git_repo import GitRepository
 from useagent.tasks.test_task import TestTask
-from useagent.tools.git import _extract_diff, extract_diff
+from useagent.tools.git import _extract_diff, ensure_current_diff, extract_diff
 
 # DevNote:
 # These tests will require that Git is installed and working.
@@ -839,6 +839,37 @@ async def test_extract_diff_store_is_updated_proxies_reflect_change(
 
     stored_entry = state.diff_store.id_to_diff[diff_id]
     assert dto[stored_entry.diff_content] == diff_id
+
+
+@pytest.mark.tool
+@pytest.mark.asyncio
+async def test_ensure_current_diff_adds_live_patch(tmp_path: Path, repo_cwd):
+    _setup_git_repo_with_change(tmp_path)
+    state = TaskState(
+        task=TestTask(root=".", issue_statement="Fix bug in foo.py"),
+        git_repo=GitRepository(local_path=tmp_path),
+    )
+
+    diff_id = await ensure_current_diff(state.diff_store)
+
+    assert diff_id == "diff_0"
+    assert "new line" in state.diff_store.id_to_diff[diff_id].diff_content
+
+
+@pytest.mark.tool
+@pytest.mark.asyncio
+async def test_ensure_current_diff_reuses_equivalent_entry(tmp_path: Path, repo_cwd):
+    _setup_git_repo_with_change(tmp_path)
+    state = TaskState(
+        task=TestTask(root=".", issue_statement="Fix bug in foo.py"),
+        git_repo=GitRepository(local_path=tmp_path),
+    )
+
+    first = await ensure_current_diff(state.diff_store)
+    second = await ensure_current_diff(state.diff_store)
+
+    assert first == second == "diff_0"
+    assert len(state.diff_store) == 1
 
 
 @pytest.mark.tool

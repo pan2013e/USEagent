@@ -50,6 +50,7 @@ from useagent.pydantic_models.tools.cliresult import CLIResult
 from useagent.pydantic_models.tools.errorinfo import ArgumentEntry, ToolErrorInfo
 from useagent.state.usage_tracker import UsageTracker, usage_tracker_name
 from useagent.tools.bash import get_bash_history
+from useagent.tools.git import ensure_current_diff
 
 USAGE_TRACKER: UsageTracker
 _ActionResultT = TypeVar("_ActionResultT")
@@ -613,23 +614,43 @@ async def vcs(
         )
         raise ModelRetry(_ordered_action_error_message(exc)) from exc
 
-    if isinstance(vcs_result.output, str) and vcs_result.output.startswith("diff_"):
-        diff_key: DiffEntryKey = vcs_result.output
-        logger.info(f"[MetaAgent] vcs_agent diff-key result: {diff_key}")
-    elif isinstance(vcs_result.output, str):
+    normalized_output = vcs_result.output
+    if isinstance(normalized_output, str) and normalized_output.startswith("diff_"):
+        diff_key: DiffEntryKey = normalized_output
+        if diff_key not in ctx.deps.diff_store.id_to_diff:  # type: ignore
+            logger.warning(
+                f"[MetaAgent] vcs_agent returned missing diff key {diff_key}; "
+                "capturing the current working-tree patch"
+            )
+            recovered = await ensure_current_diff(ctx.deps.diff_store)
+            if isinstance(recovered, ToolErrorInfo):
+                normalized_output = (
+                    f"The VCS agent returned {diff_key}, but that key was not "
+                    "stored and the current patch could not be captured: "
+                    f"{recovered.message}"
+                )
+            else:
+                diff_key = recovered
+                normalized_output = recovered
+                logger.info(
+                    f"[MetaAgent] Recovered missing VCS diff key as {recovered}"
+                )
+    if isinstance(normalized_output, str) and normalized_output.startswith("diff_"):
+        logger.info(f"[MetaAgent] vcs_agent diff-key result: {normalized_output}")
+    elif isinstance(normalized_output, str):
         logger.info(
-            f"[MetaAgent] VCS-agent returned a string-response: {vcs_result.output}"
+            f"[MetaAgent] VCS-agent returned a string-response: {normalized_output}"
         )
-    elif vcs_result.output is None:
+    elif normalized_output is None:
         logger.info("[MetaAgent] VCS-agent returned `None`")
     USAGE_TRACKER.add(usage_tracker_name(vcs_agent.name, "vcs"), vcs_result.usage())
     await _finish_top_level_action(
         checkpoint,
         ctx,
         {"instruction": instruction},
-        result=vcs_result.output,
+        result=normalized_output,
     )
-    return vcs_result.output
+    return normalized_output
 
 
 # ==========================================================================
