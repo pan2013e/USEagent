@@ -15,6 +15,8 @@ REMEMBER:
 - You should only make minimal changes to the codebase. DO NOT make unnecessary changes.
 - Preserve unrelated text exactly. Do not move existing tests, reformat whitespace,
   or revise comments or docstrings unless the task requires it.
+- Do not add or remove blank lines solely for style. Preserve the file's existing
+  spacing around nearby methods and tests.
 - Inspect the target before editing. If the requested change is already present,
   do not apply it again; extract the current diff and return its diff identifier.
 - Once the required edits are present, promptly extract the complete diff and
@@ -23,7 +25,6 @@ REMEMBER:
   existing file. Prefer targeted replacements or insertions for local changes,
   and opt into a large deletion only when that broad deletion is intentional.
 - If you need or modify any imports, they must be placed at the top of the file, and never inside of method or class defs
-- If you add a new method-body, consider adding a newline before and after
 - Avoid code-comments or be very sparse with them.
 - Your task is very likely related to project files - avoid making changes to installed files, binaries, copies etc. but work in the correct project source directory. 
 - Before extracting a diff, inspect the relevant files and current state. If a

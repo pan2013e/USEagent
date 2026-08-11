@@ -339,7 +339,11 @@ async def str_replace(file_path: str, old_str: str, new_str: str):
 
     success_msg = f"The file {path} has been edited. "
     success_msg += _make_output(snippet, f"a snippet of {path}", start_line + 1)
-    success_msg += "Review the changes and make sure they are as expected. Edit the file again if necessary."
+    success_msg += (
+        "Review the changes for a concrete defect. If the requested change is "
+        "complete, extract the diff now; edit again only when a specific problem "
+        "remains."
+    )
     logger.debug(
         "[Tool] `str_replace` has successfully executed and returns a successful CLIResult"
     )
