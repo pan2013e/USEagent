@@ -1,6 +1,7 @@
 import pytest
 from openai import OpenAIError
 from pydantic_ai.exceptions import UserError
+from pydantic_ai.models.openai import OpenAIResponsesModel
 
 from useagent.config import ConfigSingleton
 
@@ -60,6 +61,27 @@ def test_openai_with_key_passes(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "dummy")
     ConfigSingleton.init("openai:gpt-4o")
     assert ConfigSingleton.config.model
+
+
+@pytest.mark.parametrize(
+    "model_descriptor",
+    [
+        f"{prefix}{model_name}"
+        for model_name in (
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        )
+        for prefix in ("", "openai:", "openai-responses:")
+    ],
+)
+def test_gpt_5_6_models_use_responses_api(monkeypatch, model_descriptor):
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+    ConfigSingleton.init(model_descriptor)
+
+    assert isinstance(ConfigSingleton.config.model, OpenAIResponsesModel)
+    assert ConfigSingleton.config.lookup_model_context_window() == 1_050_000
 
 
 def test_uninitialized_access_fails():

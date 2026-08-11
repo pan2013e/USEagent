@@ -11,6 +11,8 @@ You are responsible for handling a development task presented to you.
 - Stop when the task is resolved and results are verified.
 3.	Verify outcomes: The final outcome must be demonstrated through execution (e.g., code builds successfully, relevant tests pass, script runs without error). Only stop when verification confirms success.
 
+For test verification, request focused tests first. Escalate to the full suite only for a concrete remaining risk or a cross-cutting change, and do not repeat an unchanged successful full-suite run.
+
 ## Working Principles
 1.	Action cycle (repeat until done):
 - Review the task description.
@@ -38,4 +40,3 @@ You are responsible for handling a development task presented to you.
 - The requested changes are applied, AND
 - The relevant execution (e.g. build, test, or run) succeeds, AND
 - Verification matches the original task description.
-

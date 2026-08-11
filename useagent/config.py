@@ -15,6 +15,16 @@ from useagent.tasks.local_task import LocalTask
 from useagent.tasks.task import Task
 
 
+OPENAI_56_MODEL_NAMES = frozenset(
+    {
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    }
+)
+
+
 def _default_optimization_toggles() -> dict[str, bool]:
     # Default Dict will return false for any unknown key, but will not give an error.
     return defaultdict(
@@ -42,6 +52,8 @@ def _default_context_window_limits() -> dict[str, int]:
     # Int value represents max-length in 'tokens', not in string length.
     # Return '-1' to mark unknown
     openai_limits = {
+        # https://developers.openai.com/api/docs/models/compare
+        **{model: 1_050_000 for model in OPENAI_56_MODEL_NAMES},
         "gpt-5.5": 1_050_000,
         "gpt-5.5-pro": 1_050_000,
         "gpt-5.4": 1_050_000,
@@ -64,6 +76,10 @@ def _default_context_window_limits() -> dict[str, int]:
             "google-gla:gemini-2.5-flash": 1048576,  # As seen in pydantic AI 0.7.5 on 25.08.2025
             **openai_limits,
             **{f"openai:{model}": limit for model, limit in openai_limits.items()},
+            **{
+                f"openai-responses:{model}": limit
+                for model, limit in openai_limits.items()
+            },
         },
     )
 
@@ -136,7 +152,21 @@ class ConfigSingleton:
                     f"[Setup] Initialized an Ollama Model (Self-Hosted) from {model_desc}"
                 )
             else:
-                model = infer_model(model)
+                provider, separator, model_name = model.partition(":")
+                if not separator:
+                    model_name = provider
+                    provider = ""
+                inference_descriptor = model
+                if model_name in OPENAI_56_MODEL_NAMES and provider in {
+                    "",
+                    "openai",
+                }:
+                    inference_descriptor = f"openai-responses:{model_name}"
+                    logger.info(
+                        "[Setup] Routing "
+                        f"{model_desc} through the OpenAI Responses API"
+                    )
+                model = infer_model(inference_descriptor)
                 logger.info(f"[Setup] Initialized a {type(model)} from {model_desc}")
         elif isinstance(model, Model):
             logger.info(

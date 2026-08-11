@@ -127,6 +127,16 @@ async def test_unknown_context_window_should_raise_clear_error(
 @pytest.mark.parametrize(
     "model_descriptor,expected",
     [
+        *[
+            (f"{prefix}{model_name}", 1_050_000)
+            for model_name in (
+                "gpt-5.6",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+            )
+            for prefix in ("", "openai:", "openai-responses:")
+        ],
         ("gpt-5.4", 1_050_000),
         ("openai:gpt-5.4-mini", 400_000),
         ("gpt-5", 400_000),

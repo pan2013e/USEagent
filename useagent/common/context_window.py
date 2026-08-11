@@ -39,13 +39,14 @@ from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from sentencepiece import SentencePieceProcessor
 from tiktoken import Encoding
 
-from useagent.config import ConfigSingleton
+from useagent.config import OPENAI_56_MODEL_NAMES, ConfigSingleton
 
 GEMMA_3_TOKENIZER_PATH = (
     Path(__file__).parent / "tokenizers" / "gemma-3-4b-it"
 ).absolute()
 
 O200K_BASE_MODEL_NAMES = {
+    *OPENAI_56_MODEL_NAMES,
     "gpt-5.5",
     "gpt-5.5-pro",
     "gpt-5.4",
@@ -846,11 +847,11 @@ def _lookup_tokenizer_for_google_models(
 def _lookup_tiktoken_encoding(model_descriptor: str) -> Encoding:
     # See Tiktokens Github Repository: https://github.com/openai/tiktoken
     # And particularly their Encoding Lookup: https://github.com/openai/tiktoken/blob/main/tiktoken/model.py
-    _model_descriptor: str = (
-        model_descriptor[len("openai:") :]
-        if model_descriptor.startswith("openai:")
-        else model_descriptor
-    )
+    _model_descriptor = model_descriptor
+    for provider_prefix in ("openai:", "openai-responses:"):
+        if _model_descriptor.startswith(provider_prefix):
+            _model_descriptor = _model_descriptor[len(provider_prefix) :]
+            break
     if _model_descriptor in O200K_BASE_MODEL_NAMES:
         return tiktoken.get_encoding("o200k_base")
 

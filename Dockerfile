@@ -17,6 +17,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 ENV UV_LINK_MODE=copy
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+
+# Task images can provide an older /usr/bin/python3. Keep the USEagent
+# interpreter self-contained so the copied virtualenv does not bind to it.
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+  uv python install 3.12
 
 RUN mkdir -p /root/.ssh && \
     printf "Host github.com\nHostname ssh.github.com\nPort 443\nUser git\n" > /root/.ssh/config && \
@@ -35,9 +41,9 @@ RUN touch README.md
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
   --mount=type=ssh \
   if [ "$USEBENCH_ENABLED" = "true" ]; then \
-    UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --locked --python /usr/bin/python3 --extra usebench --no-install-project --no-dev; \
+    UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --locked --managed-python --python 3.12 --extra usebench --no-install-project --no-dev; \
   else \
-    UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --locked --python /usr/bin/python3 --no-install-project --no-dev; \
+    UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --locked --managed-python --python 3.12 --no-install-project --no-dev; \
   fi
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -73,14 +79,25 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update -y && apt-get install -y --no-install-recommends gitlab-ci-local
 
-# bring only the ready venv and migrated data
+# Bring the managed interpreter with the ready venv. Virtualenv executables
+# refer to this directory, not to the task image's system Python.
+COPY --from=builder /opt/uv-python /opt/uv-python
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /artifact/data /app/data
 
+# The runner supplies this named BuildKit context from agent_integration/bin.
+# Keep CodeQL, the feedback provider, and downloaded qlpacks together so the
+# resulting image can run CodeQL without any host runtime mount.
+COPY --from=repo_maintainer_feedback_runtime / /feedback_provider/bin/
+RUN test -x /feedback_provider/bin/feedback_provider && \
+    test -x /feedback_provider/bin/codeql && \
+    test -n "$(find /feedback_provider/bin/codeql-linux64/codeql/qlpacks -name qlpack.yml -print -quit)"
+
 ARG USEBENCH_ENABLED=true
 ENV USEBENCH_ENABLED=${USEBENCH_ENABLED}
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 ENV VIRTUAL_ENV=/opt/venv
-ENV PATH="/opt/venv/bin:${PATH}"
+ENV PATH="/feedback_provider/bin:/opt/venv/bin:${PATH}"
 
 # These are throw-away containers; allow system package installs
 ENV PIP_BREAK_SYSTEM_PACKAGES=1

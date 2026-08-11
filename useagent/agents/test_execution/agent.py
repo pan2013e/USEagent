@@ -13,10 +13,29 @@ from useagent.microagents.decorators import (
 )
 from useagent.microagents.management import load_microagents_from_project_dir
 from useagent.pydantic_models.artifacts.test_result import TestResult
+from useagent.pydantic_models.info.environment import Commands
 from useagent.pydantic_models.task_state import TaskState
 from useagent.tools.bash import make_bash_tool_for_agent
 
 SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text()
+
+
+def format_environment_command_information(cmds: Commands) -> str:
+    details = [
+        "Here are previously identified commands relevant to this project. "
+        "Prefer the reduced form before the general test command:"
+    ]
+    if cmds.reducable_test_scope and cmds.example_reduced_test_command:
+        details.append("Reduced test example: " + cmds.example_reduced_test_command)
+    if cmds.test_command:
+        details.append("General project test command: " + cmds.test_command)
+    else:
+        details.append("Test command: unknown; derive the native command.")
+    if cmds.run_command:
+        details.append("Project run command: " + cmds.run_command)
+    if cmds.linting_command:
+        details.append("Project lint command: " + cmds.linting_command)
+    return "\n".join(details)
 
 
 @conditional_microagents_triggers(load_microagents_from_project_dir())
@@ -72,28 +91,8 @@ def init_agent(
             str: Additional Information derived from `ActiveEnvironment` if possible.
         """
         if ctx.deps.active_environment and ctx.deps.active_environment.commands:
-            cmds = ctx.deps.active_environment.commands
-            return (
-                "Here are some previously identified commands relevant for you and this project:"
-                + f"\t {cmds.test_command} to run (general) project tests (you might want to narrow it down if possible)"
-                if cmds.test_command
-                else (
-                    "\tTest Command: Unknown. You must derive it yourself."
-                    + f"\t {cmds.run_command} to run the project and e.g. its build."
-                    if cmds.run_command
-                    else (
-                        "\t Run Command: Unkown. You must derive it yourself, but it might not be important for testing."
-                        + f"\t {cmds.linting_command} to run the projects linting"
-                        if cmds.linting_command
-                        else (
-                            ""
-                            + f"\t And example reduction of test scope was achievable with commands like this: {cmds.example_reduced_test_command}"
-                            if cmds.reducable_test_scope
-                            and cmds.example_reduced_test_command
-                            else ""
-                        )
-                    )
-                )
+            return format_environment_command_information(
+                ctx.deps.active_environment.commands
             )
         else:
             logger.warning(

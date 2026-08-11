@@ -358,15 +358,18 @@ async def probe_environment(ctx: RunContext[TaskState]) -> Environment:
 
 
 async def execute_tests(ctx: RunContext[TaskState], instruction: str) -> TestResult:
-    """Execute the projects tests or a subset of the tests.
+    """Execute focused project tests, broadening only when justified.
 
     The required instructions should contain a detailed description of
     - The goal of the tests that you want to execute (i.e. what is it that you want to test)
     - any test files you already know to be relevant
-    - whether you expect to need the whole test-suite, or only a subset
+    - the smallest relevant subset to run first
+    - a concrete remaining risk if you expect the whole test-suite to be necessary
     - any code-locations that you want to be tested
 
-    This test execution might be costly, so consider gathering information first on what to execute.
+    This test execution might be costly. Gather enough information to request a
+    focused native test command first. Do not request a repeated unchanged full
+    suite merely for additional confidence.
 
     Args:
         instruction (str): Comprehensive instruction for the test execution, including tests, files, test-goals, relevant locations. Give as many details as possible.

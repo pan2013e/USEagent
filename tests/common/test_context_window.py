@@ -56,7 +56,23 @@ def test_lookup_tokenizer_for_known_google_gemini_20():
     assert isinstance(tokenizer, SentencePieceProcessor)
 
 
-@pytest.mark.parametrize("model_descriptor", ["gpt-5.4", "openai:gpt-5.4"])
+@pytest.mark.parametrize(
+    "model_descriptor",
+    [
+        f"{prefix}{model_name}"
+        for model_name in (
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        )
+        for prefix in ("", "openai:", "openai-responses:")
+    ]
+    + [
+        "gpt-5.4",
+        "openai:gpt-5.4",
+    ],
+)
 def test_lookup_tiktoken_encoding_for_current_openai_models_without_fallback_log(
     monkeypatch: pytest.MonkeyPatch,
     model_descriptor: str,
