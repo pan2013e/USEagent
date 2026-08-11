@@ -526,7 +526,16 @@ async def edit_code(
             f"[MetaAgent] `edit_code` reached its request limit {usage_exc}; "
             "capturing any current working-tree patch"
         )
-        recovered = await ensure_current_diff(ctx.deps.diff_store)
+        recovery_task = asyncio.create_task(
+            ensure_current_diff(ctx.deps.diff_store),
+            name="recover-request-limited-edit-diff",
+        )
+        recovered = await _await_top_level_action_step(
+            ctx,
+            checkpoint,
+            {"instruction": instruction},
+            recovery_task,
+        )
         if not isinstance(recovered, ToolErrorInfo):
             logger.warning(
                 f"[MetaAgent] Recovered request-limited edit as {recovered}"

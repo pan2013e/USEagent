@@ -1069,6 +1069,54 @@ async def test_edit_code_request_limit_recovers_current_diff(
 
 
 @pytest.mark.asyncio
+async def test_edit_code_request_limit_recovery_completes_ordered_protocol(
+    monkeypatch,
+    tmp_path,
+):
+    ctx = make_context(tmp_path)
+    meta.USAGE_TRACKER = UsageTracker()
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("before\n")
+    git(tmp_path, "add", "tracked.txt")
+    git(tmp_path, "commit", "-m", "add tracked file")
+    monkeypatch.chdir(tmp_path)
+    set_tool_call(ctx, "call-limited-edit")
+
+    class RequestLimitedEditAgent:
+        name = "EDIT"
+
+        async def run(self, *args, **kwargs):
+            tracked.write_text("after\n")
+            raise UsageLimitExceeded("request limit reached")
+
+    hook_ran = asyncio.Event()
+
+    async def hook(event, token):
+        assert event.action_name == "edit_code"
+        assert event.analysis_workspace is not None
+        assert (event.analysis_workspace / "tracked.txt").read_text() == "after\n"
+        hook_ran.set()
+        return HookDecision.noop()
+
+    monkeypatch.setattr(
+        meta, "init_edit_code_agent", lambda: RequestLimitedEditAgent()
+    )
+    ACTION_HOOK_MANAGER.configure_ordered_scheduler(ordered_config())
+    ACTION_HOOK_MANAGER.register(
+        hook,
+        options=HookOptions(actions=frozenset({"edit_code"})),
+    )
+
+    result = await meta.edit_code(ctx, "make a bounded edit")
+    await ACTION_HOOK_MANAGER.protocol_finalized("call-limited-edit", [])
+    await asyncio.wait_for(hook_ran.wait(), 1)
+
+    assert result == "diff_0"
+    assert "-before" in ctx.deps.diff_store.id_to_diff[result].diff_content
+    assert "+after" in ctx.deps.diff_store.id_to_diff[result].diff_content
+
+
+@pytest.mark.asyncio
 async def test_ordered_hook_filters_actions_and_receives_immutable_workspace(tmp_path):
     ctx = make_context(tmp_path)
     manager = ActionHookManager()
