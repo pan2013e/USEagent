@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
+from pydantic_ai.tools import Tool
 
 from useagent.config import ConfigSingleton
 from useagent.pydantic_models.tools.cliresult import CLIResult
@@ -45,6 +46,30 @@ async def test_run_valid_command_should_return_output(bash):
     result = await bash("echo hello")
     assert isinstance(result, CLIResult)
     assert "hello" in result.output
+
+
+@pytest.mark.asyncio
+@pytest.mark.tool
+async def test_run_accepts_null_timeout_from_model_tool_call(bash):
+    result = await bash("echo hello", timeout=None)
+    assert isinstance(result, CLIResult)
+    assert "hello" in result.output
+
+
+def test_bash_tool_schema_exposes_nullable_timeout() -> None:
+    schema = Tool(make_bash_tool_for_agent()).function_schema.json_schema
+
+    timeout_schema = schema["properties"]["timeout"]
+    assert timeout_schema["default"] is None
+    assert {"type": "null"} in timeout_schema["anyOf"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.tool
+async def test_run_honors_shorter_per_call_timeout(bash):
+    result = await bash("sleep 0.1", timeout=0.01)
+    assert isinstance(result, ToolErrorInfo)
+    assert "timed out" in result.message
 
 
 @pytest.mark.asyncio

@@ -123,7 +123,7 @@ class _BashSession:
         if self._timed_out:
             self._timed_out = False
 
-    async def run(self, command: str):
+    async def run(self, command: str, timeout: float | None = None):
         """Execute a command in the bash shell."""
 
         async def read_stream(stream, buf, sentinel=None):
@@ -184,6 +184,9 @@ class _BashSession:
                         message="You provided a large multi-line command. Such commands are currently intentionally de-actived, please refer from using them and prefer a sequence of short, simple commands, or consider different tools to write file-content. The command was not executed.",
                         supplied_arguments=[ArgumentEntry("command", command)],
                     )
+
+            if timeout is not None:
+                self._timeout = min(self._timeout, max(0.01, timeout))
 
             command_has_heredoc = has_heredoc(command)
             if command_has_heredoc:
@@ -383,7 +386,11 @@ class BashTool:
         self._bash_history = deque(maxlen=250)
 
     async def __call__(
-        self, command: str | None = None, restart: bool = False, **kwargs
+        self,
+        command: str | None = None,
+        restart: bool = False,
+        timeout: float | None = None,
+        **kwargs,
     ) -> CLIResult | ToolErrorInfo:
         if restart:
             if self._session:
@@ -457,7 +464,7 @@ class BashTool:
             return make_git_clone_warning_errorinfo()
 
         transformed_command = self.command_transformer(command)
-        return await self._session.run(transformed_command)
+        return await self._session.run(transformed_command, timeout=timeout)
 
 
 _bash_tool_instance: BashTool | None = None
@@ -482,7 +489,7 @@ def __reset_bash_tool():
 
 def make_bash_tool_for_agent(
     agent_name: str = "UNK", bash_call_delay_in_seconds: float = 0.0
-) -> Callable[[NonEmptyStr], Awaitable[CLIResult | ToolErrorInfo]]:
+) -> Callable[..., Awaitable[CLIResult | ToolErrorInfo]]:
     # DevNote:
     # This wrapper allows us to give each Agent its own, labelled (but identical) Bash Tool for logging & recording reasons.
     # If we just say `bash_tool(command,agent)` then the Agents would call it and use different variables.
@@ -491,11 +498,15 @@ def make_bash_tool_for_agent(
     #
     # So this is a bit complex, but it preserves all attributes that we want.
     # In general, we can pass more `closures` into the bash tool this way, while keeping the same interface towards the agent.
-    async def bash_tool(command: NonEmptyStr) -> CLIResult | ToolErrorInfo:
+    async def bash_tool(
+        command: NonEmptyStr, timeout: float | None = None
+    ) -> CLIResult | ToolErrorInfo:
         """Execute a bash command in the bash shell.
 
         Args:
             command (str): The command to execute.
+            timeout (float | None): Optional maximum runtime in seconds. Values
+                cannot extend the tool's built-in maximum.
 
         Returns:
             CLIResult: The result of the command execution.
@@ -513,7 +524,9 @@ def make_bash_tool_for_agent(
                 )
                 await _restart_bash_session_using_config_directory()
 
-            result = await _bash_tool(command, bash_call_delay_in_seconds)
+            result = await _bash_tool(
+                command, bash_call_delay_in_seconds, timeout=timeout
+            )
             _bash_tool_instance._bash_history.append((command, agent_name, result))
             return result
         except Exception as exc:
@@ -528,13 +541,15 @@ def make_bash_tool_for_agent(
 
 
 # Simple instance to keep backward compatability. Sets the agent to `UNK` but all other functionality is identical.
-bash_tool: Callable[[NonEmptyStr], Awaitable[CLIResult | ToolErrorInfo]] = (
+bash_tool: Callable[..., Awaitable[CLIResult | ToolErrorInfo]] = (
     make_bash_tool_for_agent()
 )
 
 
 async def _bash_tool(
-    command: NonEmptyStr, delay_in_seconds: float = 0.0
+    command: NonEmptyStr,
+    delay_in_seconds: float = 0.0,
+    timeout: float | None = None,
 ) -> CLIResult | ToolErrorInfo:
     if not _bash_tool_instance:
         raise RuntimeError("Bash Tool Instance was not set!")
@@ -556,7 +571,7 @@ async def _bash_tool(
             )
         time.sleep(delay_in_seconds)
 
-    result = await _bash_tool_instance(command)
+    result = await _bash_tool_instance(command, timeout=timeout)
     if result and isinstance(result, ToolErrorInfo):
         return result
 
